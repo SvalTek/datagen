@@ -32,6 +32,10 @@ function formatDuration(durationMs: number): string {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
+function formatPct(value: number): string {
+  return `${value.toFixed(2)}%`;
+}
+
 function formatWarningLocation(warning: StageExecutionWarning): string {
   const parts = [
     `stage=${warning.stageIdentifier}`,
@@ -212,6 +216,15 @@ export class CliReporter {
     reportPath: string;
     warningsCount: number;
     durationMs: number;
+    stageMeta?: Record<string, {
+      sampleCount: number;
+      successCount: number;
+      failureCount: number;
+      warningCount: number;
+      successRatePct: number;
+      failureRatePct: number;
+      warningRatePct: number;
+    }>;
   }): void {
     if (!this.shouldPrintSummaries()) return;
     this.clearProgressIfNeeded();
@@ -219,6 +232,13 @@ export class CliReporter {
     this.stdoutLine(`output=${input.outputJsonlPath}`);
     this.stdoutLine(`report=${input.reportPath}`);
     this.stdoutLine(`warnings=${input.warningsCount}`);
+    if (input.stageMeta) {
+      for (const [stageKey, meta] of Object.entries(input.stageMeta)) {
+        this.stdoutLine(
+          `${stageKey}: ${formatPct(meta.successRatePct)} success, ${formatPct(meta.failureRatePct)} fail, ${formatPct(meta.warningRatePct)} warn, samples=${meta.sampleCount}`,
+        );
+      }
+    }
     this.stdoutLine(`duration=${(input.durationMs / 1000).toFixed(1)}s`);
   }
 

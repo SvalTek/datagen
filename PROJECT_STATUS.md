@@ -15,6 +15,7 @@ Right now, the project can:
 - Load a pipeline from a YAML file
 - Validate that pipeline against a strict schema
 - Run stages in sequence against configured providers/runtimes (`openai` / `ollama`)
+- Resolve stage DAG execution order with explicit dependencies
 - Load source datasets from `json` or `jsonl` for transformation pipelines
 - Normalize common source dataset shapes during ingestion with `input.remap`
 - Pass prior stage outputs forward as structured JSON context
@@ -23,6 +24,7 @@ Right now, the project can:
   - `iter`: one model call per item from the previous stage's array output
 - Support `record_transform` stages for record-by-record conversation rewriting
 - Support `workflow_delegate` stages for delegated child-workflow execution
+- Support branching and conditional execution with `dependsOn` and `when`
 - Require JSON-only responses for non-constrained stages and parse them automatically
 - Use typed `constrain` schemas and structured generation for constrained stages
 - Compile `constrain` schemas into Zod validation
@@ -110,7 +112,6 @@ What is solid:
 
 What is still early:
 
-- No branching or conditional pipeline logic
 - Retry support is still narrow and only applies to iter/record_transform correction paths
 - Conversation validation is improving but still mostly lexical rather than deeply semantic
 - No persistence layer beyond generated files and run reports
@@ -120,11 +121,8 @@ What is still early:
 
 ## Evidence of current state
 
-As of March 4, 2026, the non-live automated test suite passes:
-
-- `187 passed, 0 failed`
-
-That covers the core runtime behavior, including:
+The repository includes an automated test suite covering core runtime behavior,
+including:
 
 - pipeline parsing
 - stage chaining
@@ -139,4 +137,9 @@ That covers the core runtime behavior, including:
 
 ## Current bottom line
 
-The project has moved past the idea stage. It already works as a reusable, test-covered CLI for staged synthetic dataset generation and conversation-dataset transformation, with sample pipelines and sample outputs. The next step is less about proving the concept and more about expanding the runtime: better validation, retries, branching, and stronger production ergonomics.
+The project has moved past the idea stage. It already works as a reusable,
+test-covered CLI for staged synthetic dataset generation and
+conversation-dataset transformation, with sample pipelines and sample outputs.
+The next step is less about proving the concept and more about expanding the
+runtime: deeper validation quality, broader retry control, and stronger
+production ergonomics.

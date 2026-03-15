@@ -1,0 +1,2 @@
+{"id":"chat-1","conversations":[{"from":"user","value":"Explain what checkpointing does."},{"from":"assistant","value":"Checkpointing saves progress so a long-running transform can resume after an interruption."}]}
+{"id":"chat-2","conversations":[{"from":"user","value":"What is the point of validation retries?"},{"from":"assistant","value":"Validation retries give the model another attempt when the first output breaks a rule or shape constraint."}]}

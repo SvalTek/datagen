@@ -2,6 +2,7 @@ import {
   assertEquals,
   assertRejects,
 } from "https://deno.land/std@0.203.0/assert/mod.ts";
+import { z } from "zod";
 import {
   ChatSession,
   OpenAICompatibleTransport,
@@ -240,6 +241,180 @@ Deno.test("ChatSession fork preserves reasoning transport mode and stream uses s
   assertEquals(streamPayloads[1].extra_body, {
     reasoning: { enabled: false },
   });
+});
+
+Deno.test({
+  name: "ChatSession.sendStructured defaults to off mode and performs local JSON parsing",
+  permissions: { net: true },
+  async fn() {
+    let requestBody: any;
+    const server = startLocalServer(async (req) => {
+      requestBody = await req.json();
+      return Response.json({
+        choices: [{
+          message: {
+            content: 'Wrapped output: {"count":1,"label":"ok"} End.',
+          },
+        }],
+      });
+    });
+
+    try {
+      const chat = new ChatSession(
+        "mock-model",
+        {},
+        {
+          provider: "openai",
+          endpoint: server.baseUrl,
+        },
+      );
+
+      const output = await chat.sendStructured(
+        "Emit constrained object",
+        z.object({
+          count: z.number(),
+          label: z.string(),
+        }),
+      );
+
+      assertEquals(output, { count: 1, label: "ok" });
+      assertEquals(requestBody.response_format, undefined);
+    } finally {
+      await server.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "ChatSession.sendStructured uses backend json mode when structuredOutputMode is json",
+  permissions: { net: true },
+  async fn() {
+    let requestBody: any;
+    const server = startLocalServer(async (req) => {
+      requestBody = await req.json();
+      return Response.json({
+        choices: [{
+          message: {
+            content: '{"count":2,"label":"json-mode"}',
+          },
+          finish_reason: "stop",
+        }],
+      });
+    });
+
+    try {
+      const chat = new ChatSession(
+        "mock-model",
+        {},
+        {
+          provider: "openai",
+          endpoint: server.baseUrl,
+          structuredOutputMode: "json",
+        },
+      );
+
+      const output = await chat.sendStructured(
+        "Emit constrained object",
+        z.object({
+          count: z.number(),
+          label: z.string(),
+        }),
+      );
+
+      assertEquals(output, { count: 2, label: "json-mode" });
+      assertEquals(requestBody.response_format, { type: "json_object" });
+    } finally {
+      await server.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "ChatSession.sendStructured uses schema mode when structuredOutputMode is object",
+  permissions: { net: true },
+  async fn() {
+    let requestBody: any;
+    const server = startLocalServer(async (req) => {
+      requestBody = await req.json();
+      return Response.json({
+        choices: [{
+          message: {
+            content: '{"count":3,"label":"object-mode"}',
+          },
+          finish_reason: "stop",
+        }],
+      });
+    });
+
+    try {
+      const chat = new ChatSession(
+        "mock-model",
+        {},
+        {
+          provider: "openai",
+          endpoint: server.baseUrl,
+          structuredOutputMode: "object",
+        },
+      );
+
+      const output = await chat.sendStructured(
+        "Emit constrained object",
+        z.object({
+          count: z.number(),
+          label: z.string(),
+        }),
+      );
+
+      assertEquals(output, { count: 3, label: "object-mode" });
+      assertEquals(requestBody.response_format.type, "json_schema");
+    } finally {
+      await server.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "ChatSession.sendStructured strips one outer array wrapper in json-array mode",
+  permissions: { net: true },
+  async fn() {
+    let requestBody: any;
+    const server = startLocalServer(async (req) => {
+      requestBody = await req.json();
+      return Response.json({
+        choices: [{
+          message: {
+            content: '[{"count":4,"label":"json-array-mode"}]',
+          },
+          finish_reason: "stop",
+        }],
+      });
+    });
+
+    try {
+      const chat = new ChatSession(
+        "mock-model",
+        {},
+        {
+          provider: "openai",
+          endpoint: server.baseUrl,
+          structuredOutputMode: "json-array",
+        },
+      );
+
+      const output = await chat.sendStructured(
+        "Emit constrained object",
+        z.object({
+          count: z.number(),
+          label: z.string(),
+        }),
+      );
+
+      assertEquals(output, { count: 4, label: "json-array-mode" });
+      assertEquals(requestBody.response_format, { type: "json_object" });
+    } finally {
+      await server.close();
+    }
+  },
 });
 
 Deno.test({

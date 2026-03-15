@@ -526,6 +526,7 @@ async function runStreamingRecordTransform(
       input.stage,
       () => input.chatSession.fork(),
       input.completionOptions,
+      input.pipelinePath,
     );
 
     const fatalRewriteWarning = rewriteResult.warnings.find((warning) =>
@@ -949,6 +950,7 @@ export async function runMain(args: string[]): Promise<number> {
       reportPath: run.reportPath,
       warningsCount: run.warnings.length,
       durationMs: run.durationMs,
+      stageMeta: run.result.stageMeta,
     });
     if (options.consoleMode === "full") {
       reporter.printFullReport(run.reportJson);

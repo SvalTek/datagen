@@ -1,0 +1,2 @@
+{"instruction":"Answer as a patient support engineer.","input":"Explain why a workflow might use dependsOn.","output":"A workflow uses dependsOn when one stage must wait for data produced by another stage."}
+{"instruction":"Keep the reply concise.","input":"Describe what record_transform does.","output":"record_transform rewrites each input record individually and emits one transformed record per source record."}

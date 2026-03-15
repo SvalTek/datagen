@@ -9,7 +9,9 @@ import type { ZodType } from "zod";
 import type {
   PipelineProvider,
   PipelineReasoningMode,
+  StructuredOutputMode,
 } from "../structures/TaskSchema.ts";
+import { parseModelJson } from "./ModelJson.ts";
 
 // ============================================================================
 // Types
@@ -39,6 +41,9 @@ export interface ChatTransportPayload {
   stream?: boolean;
   think?: boolean;
   extra_body?: Record<string, unknown>;
+  response_format?: {
+    type: "json_object";
+  };
 }
 
 export interface ChatTransport {
@@ -64,6 +69,7 @@ export interface ChatSessionBackendOptions {
   apiKey?: string;
   httpReferer?: string;
   xTitle?: string;
+  structuredOutputMode?: StructuredOutputMode;
 }
 
 const defaultBackendOptions: Required<
@@ -81,6 +87,12 @@ function normalizeEndpoint(endpoint?: string): string {
 function resolveReasoningMode(
   value: PipelineReasoningMode | undefined,
 ): PipelineReasoningMode {
+  return value ?? "off";
+}
+
+function resolveStructuredOutputMode(
+  value: StructuredOutputMode | undefined,
+): StructuredOutputMode {
   return value ?? "off";
 }
 
@@ -140,6 +152,54 @@ class StructuredOutputError extends Error {
     this.name = "StructuredOutputError";
     this.rawOutput = options?.rawOutput;
   }
+}
+
+function coerceStructuredOutputError(error: unknown): StructuredOutputError {
+  if (error instanceof StructuredOutputError) {
+    return error;
+  }
+
+  const rawOutput = error && typeof error === "object" &&
+      "text" in error &&
+      typeof (error as { text?: unknown }).text === "string"
+    ? (error as { text: string }).text
+    : undefined;
+
+  return new StructuredOutputError(
+    error instanceof Error ? error.message : "Structured output generation failed",
+    {
+      cause: error,
+      rawOutput,
+    },
+  );
+}
+
+function validateStructuredOutput<T>(
+  parsed: unknown,
+  schema: ZodType<T>,
+  rawOutput?: string,
+): T {
+  const validationResult = schema.safeParse(parsed);
+  if (!validationResult.success) {
+    throw new StructuredOutputError(
+      validationResult.error.issues.map((issue) => issue.message).join("; "),
+      {
+        cause: validationResult.error,
+        rawOutput,
+      },
+    );
+  }
+
+  return validationResult.data;
+}
+
+function stripOuterJsonArray(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) {
+    return raw;
+  }
+
+  return trimmed.slice(1, -1).trim();
 }
 
 // ============================================================================
@@ -291,6 +351,9 @@ function resolveChatModel(
 ): unknown {
   const provider = backendOptions.provider ?? defaultBackendOptions.provider;
   const endpoint = normalizeEndpoint(backendOptions.endpoint);
+  const structuredOutputMode = resolveStructuredOutputMode(
+    backendOptions.structuredOutputMode,
+  );
 
   if (provider === "openai") {
     const headers: Record<string, string> = {};
@@ -305,6 +368,7 @@ function resolveChatModel(
       baseURL: `${endpoint}v1`,
       apiKey: backendOptions.apiKey?.trim() || undefined,
       headers: Object.keys(headers).length > 0 ? headers : undefined,
+      supportsStructuredOutputs: structuredOutputMode === "object",
     } as any);
 
     if (typeof (client as { chatModel?: (value: string) => unknown }).chatModel === "function") {
@@ -484,52 +548,134 @@ export class ChatSession {
     schema: ZodType<T>,
     options: CompletionSettings = {},
   ): Promise<T> {
+    const structuredOutputMode = resolveStructuredOutputMode(
+      this.backendOptions.structuredOutputMode,
+    );
+
     if (this.transport) {
-      const raw = await this.send(content, options);
+      if (structuredOutputMode === "object") {
+        throw new StructuredOutputError(
+          "Structured output mode 'object' is not supported with transport-backed ChatSession instances",
+        );
+      }
+
+      const raw = structuredOutputMode === "json" || structuredOutputMode === "json-array"
+        ? await (async () => {
+          const messages = this.buildMessages(content);
+          const resolvedOptions = this.resolveEffectiveOptions(options);
+          const res = await this.transport!.request(
+            applyReasoningFields({
+              model: this.model,
+              messages,
+              max_tokens: resolvedOptions.maxTokens,
+              temperature: resolvedOptions.temperature,
+              stream: false,
+              response_format: { type: "json_object" },
+            }, resolvedOptions.think, resolvedOptions.reasoningMode),
+          );
+
+          const thoughts = (res.choices?.[0]?.message?.reasoning ?? "").toString();
+          if (thoughts.trim()) {
+            this.debugHooks.onThoughts?.(thoughts.trim());
+          }
+
+          const reply = (res.choices?.[0]?.message?.content ?? "").toString().trim();
+          this.add("user", content);
+          this.add("assistant", reply);
+          return reply;
+        })()
+        : await this.send(content, options);
+
+      const normalizedRaw = structuredOutputMode === "json-array"
+        ? stripOuterJsonArray(raw)
+        : raw;
+
       let parsed: unknown;
       try {
-        parsed = JSON.parse(raw);
+        parsed = parseModelJson(normalizedRaw);
       } catch (error) {
         throw new StructuredOutputError(
           "Model output is not valid JSON",
-          { cause: error, rawOutput: raw },
+          { cause: error, rawOutput: normalizedRaw },
         );
       }
 
-      const validationResult = schema.safeParse(parsed);
-      if (!validationResult.success) {
-        throw new StructuredOutputError(
-          validationResult.error.issues.map((issue) => issue.message).join("; "),
-          {
-            cause: validationResult.error,
-            rawOutput: raw,
-          },
-        );
-      }
-
-      return validationResult.data;
+      return validateStructuredOutput(parsed, schema, normalizedRaw);
     }
 
     const messages = this.buildMessages(content);
     const resolvedOptions = this.resolveEffectiveOptions(options);
     const modelInstance = resolveChatModel(this.model, this.backendOptions);
-    const res = await generateText({
-      model: modelInstance as any,
-      messages,
-      maxOutputTokens: resolvedOptions.maxTokens,
-      temperature: resolvedOptions.temperature,
-      output: Output.object({ schema }),
-    });
+    if (structuredOutputMode === "object") {
+      try {
+        const res = await generateText({
+          model: modelInstance as any,
+          messages,
+          maxOutputTokens: resolvedOptions.maxTokens,
+          temperature: resolvedOptions.temperature,
+          output: Output.object({ schema }),
+        });
 
-    const thoughts = extractReasoningText((res as unknown as Record<string, unknown>).reasoning);
-    if (thoughts) {
-      this.debugHooks.onThoughts?.(thoughts);
+        const thoughts = extractReasoningText((res as unknown as Record<string, unknown>).reasoning);
+        if (thoughts) {
+          this.debugHooks.onThoughts?.(thoughts);
+        }
+
+        const output = (res as { output: T }).output;
+        this.add("user", content);
+        this.add("assistant", JSON.stringify(output));
+        return output;
+      } catch (error) {
+        throw coerceStructuredOutputError(error);
+      }
     }
 
-    const output = (res as { output: T }).output;
-    this.add("user", content);
-    this.add("assistant", JSON.stringify(output));
-    return output;
+    if (structuredOutputMode === "json" || structuredOutputMode === "json-array") {
+      try {
+        const res = await generateText({
+          model: modelInstance as any,
+          messages,
+          maxOutputTokens: resolvedOptions.maxTokens,
+          temperature: resolvedOptions.temperature,
+          output: Output.json(),
+        });
+
+        const thoughts = extractReasoningText((res as unknown as Record<string, unknown>).reasoning);
+        if (thoughts) {
+          this.debugHooks.onThoughts?.(thoughts);
+        }
+
+        const output = (res as { output: unknown }).output;
+        const rawOutput = (res.text ?? "").trim() || JSON.stringify(output);
+        const normalizedRawOutput = structuredOutputMode === "json-array"
+          ? stripOuterJsonArray(rawOutput)
+          : rawOutput;
+        const parsedOutput = parseModelJson(normalizedRawOutput);
+        const validated = validateStructuredOutput(
+          parsedOutput,
+          schema,
+          normalizedRawOutput,
+        );
+        this.add("user", content);
+        this.add("assistant", rawOutput);
+        return validated;
+      } catch (error) {
+        throw coerceStructuredOutputError(error);
+      }
+    }
+
+    const raw = await this.send(content, options);
+    let parsed: unknown;
+    try {
+      parsed = parseModelJson(raw);
+    } catch (error) {
+      throw new StructuredOutputError(
+        "Model output is not valid JSON",
+        { cause: error, rawOutput: raw },
+      );
+    }
+
+    return validateStructuredOutput(parsed, schema, raw);
   }
 
   async stream(

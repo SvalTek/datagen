@@ -8,6 +8,7 @@
     "@ai-sdk/openai-compatible": "npm:@ai-sdk/openai-compatible@^2.0.33",
     "ai-sdk-ollama": "npm:ai-sdk-ollama@^3.8.0",
     "ai": "npm:ai@^6.0.112",
-    "zod": "npm:zod@^4.3.6"
+    "zod": "npm:zod@^4.3.6",
+    "LuaBridge": "https://raw.githubusercontent.com/Therosin/WebLuaBridge/refs/heads/develop/mod.ts"
   }
 }

@@ -2,7 +2,10 @@
 
 This document describes the YAML workflow format Datagen currently supports.
 
-Use it as the schema-level reference. For end-to-end examples, see [Workflow Patterns](./workflow-patterns.md). For advanced DAG behavior, see [Branching Workflows](./branching_workflows.md). For CLI flags and terminal behavior, see [CLI Reference](./cli-reference.md).
+Use it as the schema-level reference. For end-to-end examples, see
+[Workflow Patterns](./workflow-patterns.md). For advanced DAG behavior, see
+[Branching Workflows](./branching_workflows.md). For CLI flags and terminal
+behavior, see [CLI Reference](./cli-reference.md).
 
 ## Full Shape
 
@@ -14,6 +17,7 @@ description: Optional description
 model: qwen2.5:14b
 endpoint: http://localhost:11434/
 provider: openai
+structuredOutputMode: off
 reasoningMode: off
 apiKeyEnv: OPENROUTER_API_KEY
 httpReferer: https://example.com/datagen
@@ -21,6 +25,7 @@ xTitle: Datagen
 maxTokens: 4000
 temperature: 1.0
 outputDir: ./output
+repeat: 3
 
 input:
   path: ./data/source.jsonl
@@ -90,7 +95,8 @@ stages:
 
 Optional string or number.
 
-Used as a document/schema version marker only. Datagen does not currently branch runtime behavior by version.
+Used as a document/schema version marker only. Datagen does not currently branch
+runtime behavior by version.
 
 ### `name`
 
@@ -147,6 +153,37 @@ Resolution order:
 3. `DATAGEN_PROVIDER`
 4. default `openai`
 
+### `structuredOutputMode`
+
+Optional structured-output strategy for constrained stages.
+
+Supported values:
+
+- `object`
+- `json`
+- `json-array`
+- `off`
+
+Default when omitted:
+
+- `off`
+
+This field is only relevant when a stage has `constrain`.
+
+- `object`
+  - use provider/schema-based structured generation
+  - fail if the backend cannot satisfy structured object generation cleanly
+- `json`
+  - request backend JSON-object mode
+  - then parse locally and validate against the constrain schema
+- `json-array`
+  - request backend JSON-object mode
+  - strip exactly one top-level array wrapper from the raw JSON output
+  - then validate the resulting JSON text against the constrain schema
+- `off`
+  - do not request backend structured/JSON mode
+  - generate text, then parse locally and validate against the constrain schema
+
 ### `reasoningMode`
 
 Optional transport-level reasoning protocol selector.
@@ -162,12 +199,13 @@ Default when omitted:
 - `off`
 
 With AI SDK providers, reasoning behavior is provider-native. Datagen preserves
-the field for compatibility, but does not enforce legacy transport-level
-payload shaping on provider-backed requests.
+the field for compatibility, but does not enforce legacy transport-level payload
+shaping on provider-backed requests.
 
 ### `apiKeyEnv`
 
-Optional environment-variable name containing the API key for the selected endpoint.
+Optional environment-variable name containing the API key for the selected
+endpoint.
 
 Auth resolution order:
 
@@ -209,11 +247,61 @@ Optional output directory for the final JSONL dataset and default report file.
 
 Defaults to `./output`.
 
+### `repeat`
+
+Optional positive integer.
+
+Default when omitted:
+
+- `1`
+
+Runs the full non-streaming workflow this many times and appends each final
+stage output to the output JSONL.
+
+Notes:
+
+- repeated runs are independent
+- repeated runs are currently only supported for non-streaming workflows
+- repeated JSONL output preserves the normal line-oriented shape of each repeat's
+  final stage output
+- when `repeat > 1`, the final report stores per-repeat outputs as arrays under
+  `result.outputsByStage`
+- the top-level run report also includes `repeatCount` and `completedRepeats`
+
+### `luaRuntime`
+
+Optional workflow-level default Lua runtime options applied to all `mode: lua`
+stages.
+
+```yaml
+luaRuntime:
+  functionTimeoutMs: 2000
+  openStandardLibs: true
+  injectObjects: true
+  enableProxy: true
+  traceAllocations: false
+```
+
+Supported fields:
+
+- `functionTimeoutMs` non-negative integer
+- `openStandardLibs` boolean
+- `injectObjects` boolean
+- `enableProxy` boolean
+- `traceAllocations` boolean
+
+Precedence:
+
+- built-in Lua defaults
+- workflow `luaRuntime` defaults
+- per-stage `lua.runtime` override (highest precedence)
+
 ### `input`
 
 Optional source dataset configuration.
 
-Used by transform workflows. If omitted, the workflow behaves like synthetic generation or stage-driven generation.
+Used by transform workflows. If omitted, the workflow behaves like synthetic
+generation or stage-driven generation.
 
 ### `stages`
 
@@ -221,9 +309,12 @@ Required array of one or more stage objects.
 
 Stage names, if provided, must be unique.
 
+Stage ids, if provided, must be unique.
+
 ## `input`
 
-Use `input` when the workflow starts from an existing dataset instead of generating records from scratch.
+Use `input` when the workflow starts from an existing dataset instead of
+generating records from scratch.
 
 ```yaml
 input:
@@ -268,8 +359,11 @@ Current scope:
   - stage `mode` is `record_transform`
   - stage `transform.kind` is `conversation_rewrite`
   - stage input source resolves to `pipeline_input`
-- Outside that shape, Datagen falls back to eager loading/execution even if
-  `readMode: stream` is set.
+- Streaming path can be enabled by either:
+  - `input.readMode: stream`
+  - CLI `--resume`
+  - CLI `--checkpoint-every`
+- Outside that shape, Datagen falls back to eager loading/execution.
 
 ### `input.offset`
 
@@ -324,7 +418,7 @@ Example config:
 
 ```yaml
 input:
-  path: I:\DevelopmentAI\llm-arena-dataset.json
+  path: ./data/source.json
   format: json
   remap:
     kind: prefixed_string_array
@@ -352,7 +446,8 @@ Behavior:
 
 - `sourcePath` must resolve to an array
 - every array item must be a string
-- each string is matched against the configured prefixes after leading-whitespace trim
+- each string is matched against the configured prefixes after
+  leading-whitespace trim
 - the first matching prefix wins
 - the prefix is stripped
 - the remainder becomes the normalized turn content
@@ -440,8 +535,8 @@ Must be unique if present.
 
 Optional stable stage key.
 
-If present, this is used for dependency edges and output/report stage keys.
-If omitted, Datagen falls back to `name`, then positional `stage-N`.
+If present, this is used for dependency edges and output/report stage keys. If
+omitted, Datagen falls back to `name`, then positional `stage-N`.
 
 ### `description`
 
@@ -505,6 +600,7 @@ Supported values:
 - `iter`
 - `record_transform`
 - `workflow_delegate`
+- `lua`
 
 Default: `batch`
 
@@ -522,6 +618,9 @@ Execution meaning:
 - `workflow_delegate`
   - executes a child workflow file from this stage
   - writes selected child output back into this stage output
+- `lua`
+  - executes deterministic Lua logic once for the stage
+  - returns one JSON-serializable stage output value
 
 ### `dependsOn`
 
@@ -544,6 +643,8 @@ Supported operators:
 
 - `equals`
 - `notEquals`
+- `any`
+- `notAny`
 
 Exactly one must be set.
 
@@ -585,10 +686,21 @@ Supported values:
 - `pipeline_input`
 - `previous_stage`
 
+Current scope:
+
+- `input.source` is currently used by `record_transform` and `lua` stage modes.
+- `iter` always reads from dependency output (last dependency key).
+- `batch` and `workflow_delegate` do not use `input.source`.
+
 Default behavior for `record_transform`:
 
 - first stage defaults to `pipeline_input`
 - later stages default to `previous_stage`
+
+Default behavior for `lua`:
+
+- when dependencies exist, defaults to `previous_stage`
+- otherwise defaults to `pipeline_input` when pipeline input exists
 
 ### `transform`
 
@@ -609,6 +721,17 @@ transform:
   targetRoles:
     - assistant
   includeOriginalTargetTurn: true
+  turnPreprocess:
+    source: inline
+    code: |
+      local ctx = ...
+      local turn = Datagen.clone(ctx.turn)
+      local text = Datagen.get(turn, "value", "")
+      turn.length_class = (#text <= 500) and "short" or "long"
+      return turn
+  turnWhen:
+    path: length_class
+    equals: short
 ```
 
 Field meanings:
@@ -621,9 +744,22 @@ Field meanings:
   - field containing turn text
 - `targetRoles`
   - only these roles are rewritten
+  - enforced against the current target turn after `turnPreprocess`, if present
 - `includeOriginalTargetTurn`
   - whether the current original target turn is included in the prompt
   - default `true`
+- `turnPreprocess`
+  - optional Lua hook that runs once for each target turn before rewrite
+  - must return one JSON object representing the target turn
+  - useful for annotating turns with derived fields such as `length_class`
+  - Lua context includes `ctx.turn`, `ctx.record`, `ctx.turnIndex`,
+    `ctx.priorTurns`, and `ctx.transform`
+- `turnWhen`
+  - optional per-target-turn gate evaluated after `turnPreprocess`
+  - path is resolved against the current target turn object, not
+    `{ initialContext, outputsByStage }`
+  - supported operators: `equals`, `notEquals`, `any`, `notAny`
+  - when false, the target turn is preserved without calling the rewrite model
 
 ### `delegate`
 
@@ -663,7 +799,8 @@ Fields:
   - `warn` (emits warning and returns `null` stage output)
 - `inheritParentCli` optional, default `none`
   - `none`: child workflow config/env resolution only
-  - `completion`: inherits parent completion overrides (`max_tokens`, `temperature`, `parallelism`)
+  - `completion`: inherits parent completion overrides (`max_tokens`,
+    `temperature`, `parallelism`)
   - `all`: inherits parent CLI runtime overrides
 
 Delegation safety:
@@ -671,21 +808,81 @@ Delegation safety:
 - nested delegation is supported with depth limit `3`
 - cycles in delegated workflow path ancestry fail fast
 
+### `lua`
+
+Only valid for `mode: lua`.
+
+Example:
+
+```yaml
+lua:
+  source: inline
+  code: |
+    local ctx = ...
+    return { ok = true, stage = ctx.stageIdentifier }
+  runtime:
+    functionTimeoutMs: 1000
+    openStandardLibs: false
+```
+
+Fields:
+
+- `source` required
+  - `inline`
+  - `file`
+- `code` required when `source: inline`
+- `filePath` required when `source: file`
+  - relative paths resolve from the current workflow file directory
+- `runtime` optional
+  - `functionTimeoutMs` non-negative integer
+  - `openStandardLibs` boolean
+  - `injectObjects` boolean
+  - `enableProxy` boolean
+  - `traceAllocations` boolean
+
+Lua execution context:
+
+- Lua receives one vararg argument: `local ctx = ...`
+- `ctx` includes:
+  - `initialContext`
+  - `outputsByStage`
+  - `stageInput`
+  - `stageIdentifier`
+  - `stageIndex`
+
+Lua output contract:
+
+- script returns one value
+- value must be JSON-serializable
+- returned value is written to `outputsByStage[stage-key]`
+- `constrain` and `validate` are applied to returned output
+
+Lua bindings:
+
+- Datagen injects `Datagen.emitWarning(kind, message)` for non-fatal warnings
+- Datagen also injects utility bindings including `get/has/set/clone`,
+  JSON/string helpers, and `textTemplate(...)`
+- Datagen injects `LLM.generate(...)` and `LLM.generateObject(...)` bound to the
+  current workflow run's model session (also available as `Datagen.LLM`)
+- See [Lua Stage Reference](./lua-stage-reference.md) for the full binding
+  contract and runtime-global guarantees
+
 ### `constrain`
 
 Optional typed schema block.
 
 This is enforced at runtime through Zod-backed conversion.
 
-When `constrain` is present, Datagen uses structured generation in the chat
-layer instead of text output followed by manual JSON parsing.
+When `constrain` is present, Datagen switches into constrained-output handling.
+The exact strategy depends on top-level `structuredOutputMode`.
 
 Use `constrain` for:
 
 - expected object shape
 - primitive field types
 - array/object structure
-- bounds and refinements such as `min`/`max`, `minLength`/`maxLength`, and regex `pattern`
+- bounds and refinements such as `min`/`max`, `minLength`/`maxLength`, and regex
+  `pattern`
 
 Basic pattern:
 
@@ -735,8 +932,11 @@ validate:
 Notes:
 
 - `batch` and `iter` validate the stage output
-- `record_transform` validates rewritten turns before patching and validates the final transformed record after patching
-- turn-level failures in `record_transform` preserve the original turn and emit warnings instead of failing the entire run
+- `record_transform` validates rewritten turns before patching and validates the
+  final transformed record after patching
+- turn-level failures in `record_transform` usually preserve the original turn
+  and emit warnings, but fatal model-call failures can still fail the stage
+  (for example auth failures and streaming rewrite path failures)
 
 ### `retry`
 
@@ -755,7 +955,8 @@ Current scope:
 
 Behavior:
 
-- retries only on prompt-correctable failures such as invalid JSON, constrain mismatch, validator mismatch, or empty rewrite output
+- retries only on prompt-correctable failures such as invalid JSON, constrain
+  mismatch, validator mismatch, or empty rewrite output
 - `maxAttempts` counts the initial attempt
 - when `enabled: true` and `maxAttempts` is omitted, the default is `2`
 - retry feedback includes the failure reason and any validator hints
@@ -802,7 +1003,8 @@ Common rule fields:
 
 Optional workflow-defined label for a validator rule.
 
-Use this when you want warnings and retry traces to identify a validator more clearly than its rule kind alone.
+Use this when you want warnings and retry traces to identify a validator more
+clearly than its rule kind alone.
 
 Example:
 
@@ -831,7 +1033,8 @@ If omitted, the rule targets the whole current validation value.
 
 Optional user-provided correction hint.
 
-Hints are included in retry feedback, which makes them useful for stylistic or format-sensitive rules.
+Hints are included in retry feedback, which makes them useful for stylistic or
+format-sensitive rules.
 
 ### `when`
 
@@ -868,7 +1071,8 @@ Behavior:
 - `excludePatterns` remove matching spans
 - scoping runs before normalized equality or similarity comparison
 
-Use this to avoid intentional wrappers, such as `<think>...</think>`, inflating similarity scores.
+Use this to avoid intentional wrappers, such as `<think>...</think>`, inflating
+similarity scores.
 
 ### `similarity`
 
@@ -941,6 +1145,23 @@ Successful runs normally produce:
 
 - final dataset: `<resolved-output-dir>/<workflow-name>.jsonl`
 - run report: `<resolved-output-dir>/<workflow-name>.report.json`
+
+Run report notes:
+
+- `repeatCount` records the configured top-level workflow repeat count
+- `completedRepeats` records how many repeats finished successfully before the
+  run ended
+- `result.outputsByStage` stores per-stage outputs
+  - when `repeat > 1`, each stage key maps to an array of per-repeat outputs
+- `result.stageMeta` stores aggregate per-stage execution stats:
+  - counts reflect final execution outcomes, not intermediate retry attempts
+  - `sampleCount`
+  - `successCount`
+  - `failureCount`
+  - `warningCount`
+  - `successRatePct`
+  - `failureRatePct`
+  - `warningRatePct`
 
 ## CLI Overrides
 

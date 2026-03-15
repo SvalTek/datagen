@@ -1,0 +1,63 @@
+version: 1
+name: 05-lua-stage-flags
+description: Use a Lua stage to compute deterministic branch flags from upstream output.
+
+model: qwen2.5-coder:14b
+provider: ollama
+endpoint: http://localhost:11434/
+outputDir: ./examples/outputs
+
+stages:
+  - id: seed
+    instructions: >
+      Return one JSON object with:
+      - records: array of exactly 5 objects, each with id and text
+      Output valid JSON only.
+    constrain:
+      type: object
+      shape:
+        records:
+          type: array
+          minItems: 5
+          maxItems: 5
+          items:
+            type: object
+            shape:
+              id:
+                type: string
+              text:
+                type: string
+
+  - id: compute_branch_flags
+    mode: lua
+    dependsOn: [seed]
+    instructions: Compute deterministic branch flags from seed output.
+    lua:
+      source: inline
+      code: |
+        local ctx = ...
+        local seed = ctx.stageInput or {}
+        local records = seed.records or {}
+        local count = #records
+        return {
+          recordCount = count,
+          shouldRunAudit = count >= 5
+        }
+
+  - id: maybe_audit
+    dependsOn: [compute_branch_flags]
+    when:
+      path: outputsByStage.compute_branch_flags.shouldRunAudit
+      equals: true
+    instructions: >
+      Return one JSON object with:
+      - audited: true
+      - reason: short string
+      Output valid JSON only.
+    constrain:
+      type: object
+      shape:
+        audited:
+          type: boolean
+        reason:
+          type: string

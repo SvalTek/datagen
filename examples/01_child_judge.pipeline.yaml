@@ -1,0 +1,48 @@
+version: 1
+name: 01-child-judge
+description: Child workflow used by workflow_delegate example.
+
+model: qwen2.5-coder:14b
+provider: ollama
+endpoint: http://localhost:11434/
+reasoningMode: off
+maxTokens: 1536
+temperature: 0.4
+outputDir: ./examples/outputs
+
+stages:
+  - id: judge
+    instructions: >
+      initialContext is an array of normalized records.
+      Return JSON object:
+      {
+        "review": {
+          "recommendation": "accept" | "revise",
+          "confidence": number
+        },
+        "reason": string
+      }
+    constrain:
+      type: object
+      shape:
+        review:
+          type: object
+          shape:
+            recommendation:
+              type: enum
+              values:
+                - accept
+                - revise
+            confidence:
+              type: number
+              min: 0
+              max: 1
+        reason:
+          type: string
+          minLength: 3
+    validate:
+      onFailure: fail
+      rules:
+        - path: reason
+          kind: min_length
+          value: 3

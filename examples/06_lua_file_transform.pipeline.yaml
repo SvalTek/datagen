@@ -1,0 +1,56 @@
+version: 1
+name: 06-lua-file-transform
+description: Use a file-backed Lua stage to normalize upstream output shape.
+
+model: qwen2.5-coder:14b
+provider: ollama
+endpoint: http://localhost:11434/
+outputDir: ./examples/outputs
+
+stages:
+  - id: seed
+    instructions: >
+      Return one JSON object with:
+      - records: array of 3 objects with id and text
+      Output valid JSON only.
+    constrain:
+      type: object
+      shape:
+        records:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            type: object
+            shape:
+              id:
+                type: string
+              text:
+                type: string
+
+  - id: normalize_with_lua_file
+    mode: lua
+    dependsOn: [seed]
+    instructions: Normalize text fields with a Lua script file.
+    lua:
+      source: file
+      filePath: ./lua/normalize.lua
+      runtime:
+        functionTimeoutMs: 1000
+        openStandardLibs: false
+    constrain:
+      type: object
+      shape:
+        records:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            type: object
+            shape:
+              id:
+                type: string
+              text:
+                type: string
+              normalized:
+                type: boolean

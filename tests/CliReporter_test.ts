@@ -34,24 +34,39 @@ Deno.test("CliReporter summary mode prints start and finish summaries", () => {
     endpoint: "http://localhost:11434/",
     inputPath: "./data/input.jsonl",
     inputRecordCount: 2,
-    outputJsonlPath: "./output/demo.jsonl",
+    outputJsonlPath: "./tests/outputs/demo.jsonl",
     stageCount: 1,
     firstStageMode: "record_transform",
   });
   reporter.finishSuccess({
-    outputJsonlPath: "./output/demo.jsonl",
-    reportPath: "./output/demo.report.json",
+    outputJsonlPath: "./tests/outputs/demo.jsonl",
+    reportPath: "./tests/outputs/demo.report.json",
     warningsCount: 3,
     durationMs: 1234,
+    stageMeta: {
+      rewrite: {
+        sampleCount: 100,
+        successCount: 96,
+        failureCount: 4,
+        warningCount: 4,
+        successRatePct: 96,
+        failureRatePct: 4,
+        warningRatePct: 4,
+      },
+    },
   });
 
   assertEquals(stdout[0], "Running demo");
   assertStringIncludes(stdout[1], "model=mock-model");
-  assertStringIncludes(stdout[2], "output=./output/demo.jsonl");
+  assertStringIncludes(stdout[2], "output=./tests/outputs/demo.jsonl");
   assertEquals(stdout[3], "Done");
-  assertEquals(stdout[4], "output=./output/demo.jsonl");
-  assertEquals(stdout[5], "report=./output/demo.report.json");
+  assertEquals(stdout[4], "output=./tests/outputs/demo.jsonl");
+  assertEquals(stdout[5], "report=./tests/outputs/demo.report.json");
   assertEquals(stdout[6], "warnings=3");
+  assertEquals(
+    stdout[7],
+    "rewrite: 96.00% success, 4.00% fail, 4.00% warn, samples=100",
+  );
 });
 
 Deno.test("CliReporter failure summary can print an auth hint", () => {
@@ -64,7 +79,7 @@ Deno.test("CliReporter failure summary can print an auth hint", () => {
   reporter.finishFailure({
     errorType: "AuthenticationError",
     hint: "Check whether your API token or apiKeyEnv variable is missing.",
-    reportPath: "./output/demo.report.json",
+    reportPath: "./tests/outputs/demo.report.json",
     durationMs: 250,
   });
 
@@ -74,7 +89,7 @@ Deno.test("CliReporter failure summary can print an auth hint", () => {
     stderr[2],
     "hint=Check whether your API token or apiKeyEnv variable is missing.",
   );
-  assertEquals(stderr[3], "report=./output/demo.report.json");
+  assertEquals(stderr[3], "report=./tests/outputs/demo.report.json");
 });
 
 Deno.test("CliReporter warnings mode prints compact warning lines", () => {
@@ -145,13 +160,13 @@ Deno.test("CliReporter full mode only emits full report output", () => {
     pipelineName: "demo",
     pipelinePath: "demo.pipeline.yaml",
     model: "mock-model",
-    outputJsonlPath: "./output/demo.jsonl",
+    outputJsonlPath: "./tests/outputs/demo.jsonl",
     stageCount: 1,
     firstStageMode: "batch",
   });
   reporter.finishSuccess({
-    outputJsonlPath: "./output/demo.jsonl",
-    reportPath: "./output/demo.report.json",
+    outputJsonlPath: "./tests/outputs/demo.jsonl",
+    reportPath: "./tests/outputs/demo.report.json",
     warningsCount: 0,
     durationMs: 10,
   });

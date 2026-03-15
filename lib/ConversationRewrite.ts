@@ -4,6 +4,7 @@ import {
 } from "./ChatSession.ts";
 import type { StageInput } from "../structures/TaskSchema.ts";
 import { getValueAtPath } from "./ObjectPath.ts";
+import { executeLuaStage } from "./LuaStageRuntime.ts";
 import {
   validateStageValue,
   type ValidationIssue,
@@ -18,6 +19,8 @@ export interface ConversationRewriteWarning {
     | "missing_conversations_path"
     | "invalid_conversations_value"
     | "invalid_turn_shape"
+    | "turn_preprocess_failed"
+    | "invalid_turn_preprocess_output"
     | "model_call_failed"
     | "empty_output"
     | "validator_mismatch"
@@ -44,6 +47,127 @@ export interface ConversationRewriteResult {
   record: unknown;
   warnings: ConversationRewriteWarning[];
   traces: ConversationRewriteTrace[];
+}
+
+function evaluateTurnWhen(
+  transform: NonNullable<StageInput["transform"]>,
+  turn: unknown,
+): boolean {
+  if (!transform.turnWhen) return true;
+
+  let target: unknown;
+  try {
+    target = getValueAtPath(turn, transform.turnWhen.path);
+  } catch {
+    return false;
+  }
+
+  if (transform.turnWhen.equals !== undefined) {
+    return target === transform.turnWhen.equals;
+  }
+
+  if (transform.turnWhen.notEquals !== undefined) {
+    return target !== transform.turnWhen.notEquals;
+  }
+
+  if (transform.turnWhen.any !== undefined) {
+    return transform.turnWhen.any.some((candidate) => target === candidate);
+  }
+
+  if (transform.turnWhen.notAny !== undefined) {
+    return !transform.turnWhen.notAny.some((candidate) => target === candidate);
+  }
+
+  return true;
+}
+
+async function preprocessTurn(
+  input: {
+    record: unknown;
+    turn: unknown;
+    turnIndex: number;
+    priorTurns: unknown[];
+    stage: StageInput;
+    transform: NonNullable<StageInput["transform"]>;
+    sessionFactory: () => ChatSession;
+    completionOptions?: CompletionSettings;
+    workflowPath?: string;
+  },
+): Promise<
+  | {
+    ok: true;
+    turn: Record<string, unknown>;
+  }
+  | {
+    ok: false;
+    warning: ConversationRewriteWarning;
+  }
+> {
+  if (!input.transform.turnPreprocess) {
+    return { ok: true, turn: input.turn as Record<string, unknown> };
+  }
+
+  const luaStage: StageInput = {
+    name: `${input.stage.name ?? input.stage.id ?? "conversation_rewrite"}_turn_preprocess`,
+    instructions: "Preprocess the current target turn before conversation rewrite.",
+    mode: "lua",
+    reasoning: input.stage.reasoning,
+    lua: input.transform.turnPreprocess,
+  };
+
+  const run = await executeLuaStage({
+    stage: luaStage,
+    stageIdentifier: luaStage.name ?? "conversation_rewrite_turn_preprocess",
+    stageIndex: -1,
+    workflowPath: input.workflowPath ?? ".",
+    context: {
+      initialContext: undefined,
+      outputsByStage: {},
+      stageInput: input.turn,
+      stageIdentifier: luaStage.name ?? "conversation_rewrite_turn_preprocess",
+      stageIndex: -1,
+      record: input.record,
+      turn: input.turn,
+      turnIndex: input.turnIndex,
+      priorTurns: input.priorTurns,
+      transform: input.transform,
+    },
+    llmRequest: async (prompt, options) => {
+      const session = input.sessionFactory();
+      return await session.send(prompt, {
+        ...input.completionOptions,
+        think: input.stage.reasoning ?? input.completionOptions?.think ?? false,
+        ...options,
+      });
+    },
+  });
+
+  if (!run.ok) {
+    return {
+      ok: false,
+      warning: {
+        kind: "turn_preprocess_failed",
+        turnIndex: input.turnIndex,
+        message: run.message,
+      },
+    };
+  }
+
+  if (!run.output || typeof run.output !== "object" || Array.isArray(run.output)) {
+    return {
+      ok: false,
+      warning: {
+        kind: "invalid_turn_preprocess_output",
+        turnIndex: input.turnIndex,
+        message: "turnPreprocess must return a JSON object representing the target turn",
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    turn: run.output as Record<string, unknown>,
+  };
 }
 
 function findPreviousTurnWithSameRole(
@@ -309,6 +433,7 @@ export async function rewriteConversationRecord(
   stage: StageInput,
   sessionFactory: () => ChatSession,
   completionOptions?: CompletionSettings,
+  workflowPath?: string,
 ): Promise<ConversationRewriteResult> {
   const transformedRecord = structuredClone(record);
   const warnings: ConversationRewriteWarning[] = [];
@@ -387,6 +512,55 @@ export async function rewriteConversationRecord(
       continue;
     }
 
+    const preprocessedTurn = await preprocessTurn({
+      record: transformedRecord,
+      turn: currentTurnObject,
+      turnIndex,
+      priorTurns: turns.slice(0, turnIndex),
+      stage,
+      transform,
+      sessionFactory,
+      completionOptions,
+      workflowPath,
+    });
+    if (!preprocessedTurn.ok) {
+      warnings.push(preprocessedTurn.warning);
+      continue;
+    }
+
+    turns[turnIndex] = preprocessedTurn.turn;
+    const currentTargetTurn = turns[turnIndex] as Record<string, unknown>;
+
+    const targetRole = currentTargetTurn[transform.roleField];
+    const targetContent = currentTargetTurn[transform.contentField];
+    if (typeof targetRole !== "string") {
+      warnings.push({
+        kind: "invalid_turn_shape",
+        turnIndex,
+        message:
+          `Turn ${turnIndex} is missing string role field '${transform.roleField}' after turnPreprocess`,
+      });
+      continue;
+    }
+
+    if (typeof targetContent !== "string") {
+      warnings.push({
+        kind: "invalid_turn_shape",
+        turnIndex,
+        message:
+          `Turn ${turnIndex} is missing string content field '${transform.contentField}' after turnPreprocess`,
+      });
+      continue;
+    }
+
+    if (!transform.targetRoles.includes(targetRole)) {
+      continue;
+    }
+
+    if (!evaluateTurnWhen(transform, currentTargetTurn)) {
+      continue;
+    }
+
     let feedbackAppendix: string | undefined;
     let finalWarning: ConversationRewriteWarning | undefined;
 
@@ -396,7 +570,7 @@ export async function rewriteConversationRecord(
         sessionFactory,
         completionOptions,
         priorTurns: turns.slice(0, turnIndex),
-        currentTurn,
+        currentTurn: currentTargetTurn,
         turnIndex,
         transform,
         promptFeedbackAppendix: feedbackAppendix,
@@ -406,7 +580,7 @@ export async function rewriteConversationRecord(
 
       traces.push(attemptResult.trace);
       if (attemptResult.ok) {
-        currentTurnObject[transform.contentField] = attemptResult.rewrittenContent;
+        currentTargetTurn[transform.contentField] = attemptResult.rewrittenContent;
         finalWarning = undefined;
         break;
       }

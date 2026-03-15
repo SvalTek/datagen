@@ -1,26 +1,30 @@
 import { ChatSession, type CompletionSettings } from "./ChatSession.ts";
-import type { StageInput } from "../structures/TaskSchema.ts";
+import type {
+  LuaRuntimeOptionsInput,
+  StageInput,
+} from "../structures/TaskSchema.ts";
 import { constrainToZodSchema } from "./ConstrainToZod.ts";
 import {
-  rewriteConversationRecord,
   type ConversationRewriteWarning,
+  rewriteConversationRecord,
 } from "./ConversationRewrite.ts";
-import {
-  validateStageValue,
-  type ValidationIssue,
-} from "./StageValidator.ts";
+import { validateStageValue, type ValidationIssue } from "./StageValidator.ts";
 import {
   buildRetryFeedbackAppendix,
   type RetryFailureKind,
 } from "./RetryFeedback.ts";
 import { parseModelJson } from "./ModelJson.ts";
 import { getValueAtPath } from "./ObjectPath.ts";
+import { executeLuaStage } from "./LuaStageRuntime.ts";
 
 export type StageExecutionErrorKind =
   | "invalid_json"
   | "invalid_iter_input"
   | "invalid_record_transform_input"
   | "delegated_workflow_failed"
+  | "lua_execution_failed"
+  | "lua_invalid_output"
+  | "lua_script_load_failed"
   | "constrain_mismatch"
   | "validator_mismatch"
   | "model_call_failed";
@@ -36,6 +40,7 @@ export interface StageExecutionError {
 }
 
 export interface StageExecutionTrace {
+  repeatIndex?: number;
   stageIdentifier: string;
   stageIndex: number;
   stageStatus?: "executed" | "skipped" | "blocked";
@@ -45,6 +50,7 @@ export interface StageExecutionTrace {
   inputContextSnapshot: {
     initialContext?: unknown;
     currentIterItem?: unknown;
+    stageInput?: unknown;
     priorStageOutputs: Array<{
       stageIdentifier: string;
       output: unknown;
@@ -66,11 +72,17 @@ export interface StageExecutionTrace {
     childWarningsCount: number;
     childTraces: StageExecutionTrace[];
   };
+  luaScriptSnapshot?: string;
+  luaScriptPath?: string;
+  luaMetrics?: Array<{ name: string; value: number }>;
+  luaNotes?: Array<{ kind: string; value: unknown }>;
+  luaDebugEntries?: Array<{ label: string; value: unknown }>;
   error?: StageExecutionError;
   success: boolean;
 }
 
 export interface StageExecutionWarning {
+  repeatIndex?: number;
   stageIdentifier: string;
   stageIndex: number;
   recordIndex?: number;
@@ -87,9 +99,19 @@ export interface StageExecutionResult {
   traces: StageExecutionTrace[];
   outputsByStage: Record<string, unknown>;
   warnings: StageExecutionWarning[];
+  stageMeta?: Record<string, {
+    sampleCount: number;
+    successCount: number;
+    failureCount: number;
+    warningCount: number;
+    successRatePct: number;
+    failureRatePct: number;
+    warningRatePct: number;
+  }>;
   stageStatuses: Record<string, "executed" | "skipped" | "blocked">;
   dependencyGraph: Record<string, string[]>;
   failedStage?: {
+    repeatIndex?: number;
     stageIdentifier: string;
     stageIndex: number;
     error: StageExecutionError;
@@ -99,7 +121,7 @@ export interface StageExecutionResult {
 export interface StageExecutionProgressEvent {
   stageIdentifier: string;
   stageIndex: number;
-  mode: "batch" | "iter" | "record_transform" | "workflow_delegate";
+  mode: "batch" | "iter" | "record_transform" | "workflow_delegate" | "lua";
   current: number;
   total?: number;
   warningsSoFar: number;
@@ -127,6 +149,8 @@ export interface DelegatedWorkflowResult {
 
 export interface StageExecutionEngineConfig {
   model: string;
+  workflowPath?: string;
+  luaRuntimeDefaults?: LuaRuntimeOptionsInput;
   chatSession?: ChatSession;
   completionOptions?: CompletionSettings;
   globalParallelism?: number;
@@ -170,7 +194,8 @@ function resolveStageGraph(stages: StageInput[]): {
   const resolvedNodes: ResolvedStageNode[] = [];
 
   for (const node of nodes) {
-    const explicitDeps = node.stage.dependsOn?.map((value) => value.trim()).filter(Boolean);
+    const explicitDeps = node.stage.dependsOn?.map((value) => value.trim())
+      .filter(Boolean);
     let dependencies: string[];
     if (explicitDeps?.length) {
       dependencies = explicitDeps;
@@ -182,7 +207,9 @@ function resolveStageGraph(stages: StageInput[]): {
 
     for (const dep of dependencies) {
       if (!nodeMap.has(dep)) {
-        throw new Error(`Stage '${node.key}' depends on unknown stage '${dep}'`);
+        throw new Error(
+          `Stage '${node.key}' depends on unknown stage '${dep}'`,
+        );
       }
       if (dep === node.key) {
         throw new Error(`Stage '${node.key}' cannot depend on itself`);
@@ -215,7 +242,9 @@ function resolveStageGraph(stages: StageInput[]): {
       const next = (inDegree.get(nextKey) ?? 0) - 1;
       inDegree.set(nextKey, next);
       if (next === 0) {
-        const nextNode = resolvedNodes.find((candidate) => candidate.key === nextKey)!;
+        const nextNode = resolvedNodes.find((candidate) =>
+          candidate.key === nextKey
+        )!;
         ready.push(nextNode);
         ready.sort((a, b) => a.originalIndex - b.originalIndex);
       }
@@ -223,7 +252,9 @@ function resolveStageGraph(stages: StageInput[]): {
   }
 
   if (ordered.length !== resolvedNodes.length) {
-    const unresolved = resolvedNodes.filter((node) => !ordered.some((item) => item.key === node.key));
+    const unresolved = resolvedNodes.filter((node) =>
+      !ordered.some((item) => item.key === node.key)
+    );
     throw new Error(
       `Cycle detected in stage dependency graph involving: ${
         unresolved.map((node) => node.key).join(", ")
@@ -262,6 +293,14 @@ function evaluateStageWhen(
 
   if (stage.when.notEquals !== undefined) {
     return target !== stage.when.notEquals;
+  }
+
+  if (stage.when.any !== undefined) {
+    return stage.when.any.some((candidate) => target === candidate);
+  }
+
+  if (stage.when.notAny !== undefined) {
+    return !stage.when.notAny.some((candidate) => target === candidate);
   }
 
   return true;
@@ -383,6 +422,8 @@ export class StageExecutionEngine {
   private readonly chatSession: ChatSession;
   private readonly completionOptions?: CompletionSettings;
   private readonly globalParallelism: number;
+  private readonly workflowPath: string;
+  private readonly luaRuntimeDefaults?: LuaRuntimeOptionsInput;
   private readonly onProgress?: (event: StageExecutionProgressEvent) => void;
   private readonly onWarning?: (warning: StageExecutionWarning) => void;
   private readonly runDelegatedWorkflow?: (
@@ -391,6 +432,8 @@ export class StageExecutionEngine {
 
   constructor(config: StageExecutionEngineConfig) {
     this.chatSession = config.chatSession ?? new ChatSession(config.model);
+    this.workflowPath = config.workflowPath ?? ".";
+    this.luaRuntimeDefaults = config.luaRuntimeDefaults;
     this.completionOptions = config.completionOptions;
     this.globalParallelism = normalizeParallelism(config.globalParallelism);
     this.onProgress = config.progress?.onProgress;
@@ -443,7 +486,10 @@ export class StageExecutionEngine {
       }
     };
 
-    const workers = Array.from({ length: Math.min(total, concurrency) }, () => runWorker());
+    const workers = Array.from(
+      { length: Math.min(total, concurrency) },
+      () => runWorker(),
+    );
     await Promise.all(workers);
     if (firstError) {
       throw firstError;
@@ -529,7 +575,8 @@ export class StageExecutionEngine {
         rawModelOutput = JSON.stringify(parsedJsonOutput);
       } catch (error) {
         const maybeRawOutput = error && typeof error === "object" &&
-            "rawOutput" in error && typeof (error as { rawOutput?: unknown }).rawOutput === "string"
+            "rawOutput" in error &&
+            typeof (error as { rawOutput?: unknown }).rawOutput === "string"
           ? (error as { rawOutput: string }).rawOutput
           : undefined;
         const executionError: StageExecutionError = {
@@ -562,7 +609,10 @@ export class StageExecutionEngine {
       }
     } else {
       try {
-        rawModelOutput = await this.chatSession.send(finalPrompt, completionOptions);
+        rawModelOutput = await this.chatSession.send(
+          finalPrompt,
+          completionOptions,
+        );
       } catch (error) {
         const executionError: StageExecutionError = {
           kind: "model_call_failed",
@@ -654,7 +704,10 @@ export class StageExecutionEngine {
     }
 
     if (stage.validate) {
-      const validationResult = validateStageValue(parsedJsonOutput, stage.validate);
+      const validationResult = validateStageValue(
+        parsedJsonOutput,
+        stage.validate,
+      );
       if (!validationResult.success) {
         if ((stage.validate.onFailure ?? "fail") === "warn") {
           return {
@@ -815,19 +868,25 @@ export class StageExecutionEngine {
     const traces: StageExecutionTrace[] = [];
     const outputsByStage: Record<string, unknown> = {};
     const warnings: StageExecutionWarning[] = [];
-    const stageStatuses: Record<string, "executed" | "skipped" | "blocked"> = {};
+    const stageStatuses: Record<string, "executed" | "skipped" | "blocked"> =
+      {};
     const priorStageOutputs: Array<
       { stageIdentifier: string; output: unknown }
     > = [];
     let dependencyGraph: Record<string, string[]> = {};
 
-    let resolvedGraph: { executionOrder: ResolvedStageNode[]; dependencyGraph: Record<string, string[]> };
+    let resolvedGraph: {
+      executionOrder: ResolvedStageNode[];
+      dependencyGraph: Record<string, string[]>;
+    };
     try {
       resolvedGraph = resolveStageGraph(stages);
       dependencyGraph = resolvedGraph.dependencyGraph;
     } catch (error) {
       const stageIndex = 0;
-      const stageIdentifierValue = stages[0] ? stageIdentifier(stages[0], 0) : "stage-1";
+      const stageIdentifierValue = stages[0]
+        ? stageIdentifier(stages[0], 0)
+        : "stage-1";
       const executionError: StageExecutionError = {
         kind: "invalid_record_transform_input",
         stageIdentifier: stageIdentifierValue,
@@ -1048,12 +1107,16 @@ export class StageExecutionEngine {
           };
         }
 
-        if ((stage.delegate.inputAs ?? "initial_context") === "pipeline_input" && !Array.isArray(mappedInput)) {
+        if (
+          (stage.delegate.inputAs ?? "initial_context") === "pipeline_input" &&
+          !Array.isArray(mappedInput)
+        ) {
           const executionError: StageExecutionError = {
             kind: "delegated_workflow_failed",
             stageIdentifier: identifier,
             stageIndex: index,
-            message: "delegate inputAs=pipeline_input requires mapped input to be a JSON array",
+            message:
+              "delegate inputAs=pipeline_input requires mapped input to be a JSON array",
             retryable: false,
           };
           if ((stage.delegate.onFailure ?? "fail") === "warn") {
@@ -1134,13 +1197,18 @@ export class StageExecutionEngine {
         try {
           const outputFrom = stage.delegate.outputFrom ?? "final_stage_output";
           if (outputFrom === "stage_key") {
-            selectedOutput = delegated.result.outputsByStage[stage.delegate.outputStageKey!];
+            selectedOutput =
+              delegated.result.outputsByStage[stage.delegate.outputStageKey!];
           } else {
-            selectedOutput = delegated.result.outputsByStage[delegated.finalStageKey];
+            selectedOutput =
+              delegated.result.outputsByStage[delegated.finalStageKey];
           }
 
           if (stage.delegate.outputSelectPath?.trim()) {
-            selectedOutput = getValueAtPath(selectedOutput, stage.delegate.outputSelectPath.trim());
+            selectedOutput = getValueAtPath(
+              selectedOutput,
+              stage.delegate.outputSelectPath.trim(),
+            );
           }
         } catch (error) {
           if ((stage.delegate.onFailure ?? "fail") === "warn") {
@@ -1200,9 +1268,8 @@ export class StageExecutionEngine {
           }
         }
 
-        const delegatedExecutionError: StageExecutionError | undefined = delegated.ok
-          ? undefined
-          : {
+        const delegatedExecutionError: StageExecutionError | undefined =
+          delegated.ok ? undefined : {
             kind: "delegated_workflow_failed",
             stageIdentifier: identifier,
             stageIndex: index,
@@ -1212,7 +1279,10 @@ export class StageExecutionEngine {
             retryable: false,
           };
 
-        if (delegatedExecutionError && (stage.delegate.onFailure ?? "fail") === "fail") {
+        if (
+          delegatedExecutionError &&
+          (stage.delegate.onFailure ?? "fail") === "fail"
+        ) {
           traces.push({
             stageIdentifier: identifier,
             stageIndex: index,
@@ -1252,7 +1322,10 @@ export class StageExecutionEngine {
           };
         }
 
-        if (delegatedExecutionError && (stage.delegate.onFailure ?? "fail") === "warn") {
+        if (
+          delegatedExecutionError &&
+          (stage.delegate.onFailure ?? "fail") === "warn"
+        ) {
           this.appendWarnings(warnings, {
             stageIdentifier: identifier,
             stageIndex: index,
@@ -1344,6 +1417,321 @@ export class StageExecutionEngine {
         continue;
       }
 
+      if (mode === "lua") {
+        const source = stage.input?.source ??
+          (node.dependencies.length > 0
+            ? "previous_stage"
+            : pipelineInputRecords !== undefined
+            ? "pipeline_input"
+            : undefined);
+
+        if (source === "previous_stage" && node.dependencies.length === 0) {
+          const executionError: StageExecutionError = {
+            kind: "lua_execution_failed",
+            stageIdentifier: identifier,
+            stageIndex: index,
+            message:
+              "lua stage cannot read previous_stage when no dependency stage exists",
+            retryable: false,
+          };
+          traces.push({
+            stageIdentifier: identifier,
+            stageIndex: index,
+            stageStatus: "executed",
+            promptSnapshot: "",
+            inputContextSnapshot: {
+              initialContext,
+              stageInput: undefined,
+              priorStageOutputs: [...priorStageOutputs],
+            },
+            error: executionError,
+            success: false,
+          });
+          return {
+            ok: false,
+            traces,
+            outputsByStage,
+            warnings,
+            stageStatuses,
+            dependencyGraph,
+            failedStage: {
+              stageIdentifier: identifier,
+              stageIndex: index,
+              error: executionError,
+            },
+          };
+        }
+
+        const dependencyKey = node.dependencies[node.dependencies.length - 1];
+        const stageInput = source === "pipeline_input"
+          ? pipelineInputRecords
+          : source === "previous_stage" && dependencyKey
+          ? outputsByStage[dependencyKey]
+          : undefined;
+
+        const run = await executeLuaStage({
+          stage,
+          stageIdentifier: identifier,
+          stageIndex: index,
+          workflowPath: this.workflowPath,
+          pipelineRuntime: this.luaRuntimeDefaults,
+          context: {
+            initialContext,
+            outputsByStage,
+            stageInput,
+            stageIdentifier: identifier,
+            stageIndex: index,
+          },
+          llmRequest: async (prompt, options) => {
+            const resolvedOptions: CompletionSettings = {
+              ...this.completionOptions,
+              think: stage.reasoning ?? false,
+              ...options,
+            };
+            return await this.chatSession.send(prompt, resolvedOptions);
+          },
+        });
+
+        if (run.warnings.length > 0) {
+          this.appendWarnings(
+            warnings,
+            ...run.warnings.map((warning) => ({
+              stageIdentifier: identifier,
+              stageIndex: index,
+              kind: warning.kind,
+              message: warning.message,
+            })),
+          );
+        }
+
+        const luaTelemetry = {
+          luaMetrics: run.metrics.length > 0 ? run.metrics : undefined,
+          luaNotes: run.notes.length > 0 ? run.notes : undefined,
+          luaDebugEntries: run.debugEntries.length > 0
+            ? run.debugEntries
+            : undefined,
+        };
+
+        if (!run.ok) {
+          const executionError: StageExecutionError = {
+            kind: run.errorKind,
+            stageIdentifier: identifier,
+            stageIndex: index,
+            message: run.message,
+            retryable: false,
+            cause: run.cause,
+          };
+          traces.push({
+            stageIdentifier: identifier,
+            stageIndex: index,
+            stageStatus: "executed",
+            promptSnapshot: "",
+            inputContextSnapshot: {
+              initialContext,
+              stageInput,
+              priorStageOutputs: [...priorStageOutputs],
+            },
+            luaScriptSnapshot: run.scriptText,
+            luaScriptPath: run.resolvedFilePath,
+            ...luaTelemetry,
+            error: executionError,
+            success: false,
+          });
+          return {
+            ok: false,
+            traces,
+            outputsByStage,
+            warnings,
+            stageStatuses,
+            dependencyGraph,
+            failedStage: {
+              stageIdentifier: identifier,
+              stageIndex: index,
+              error: executionError,
+            },
+          };
+        }
+
+        let luaOutput: unknown = run.output;
+        if (stage.constrain) {
+          let constrainSchema;
+          try {
+            constrainSchema = constrainToZodSchema(stage.constrain);
+          } catch (error) {
+            const executionError: StageExecutionError = {
+              kind: "constrain_mismatch",
+              stageIdentifier: identifier,
+              stageIndex: index,
+              message: error instanceof Error
+                ? `Invalid stage constrain declaration: ${error.message}`
+                : "Invalid stage constrain declaration",
+              retryable: false,
+              cause: error,
+            };
+            traces.push({
+              stageIdentifier: identifier,
+              stageIndex: index,
+              stageStatus: "executed",
+              promptSnapshot: "",
+              inputContextSnapshot: {
+                initialContext,
+                stageInput,
+                priorStageOutputs: [...priorStageOutputs],
+              },
+              parsedJsonOutput: luaOutput,
+              luaScriptSnapshot: run.scriptText,
+              luaScriptPath: run.resolvedFilePath,
+              ...luaTelemetry,
+              error: executionError,
+              success: false,
+            });
+            return {
+              ok: false,
+              traces,
+              outputsByStage,
+              warnings,
+              stageStatuses,
+              dependencyGraph,
+              failedStage: {
+                stageIdentifier: identifier,
+                stageIndex: index,
+                error: executionError,
+              },
+            };
+          }
+
+          const parsed = constrainSchema.safeParse(luaOutput);
+          if (!parsed.success) {
+            const executionError: StageExecutionError = {
+              kind: "constrain_mismatch",
+              stageIdentifier: identifier,
+              stageIndex: index,
+              message: `Model output does not satisfy stage constrain schema: ${
+                parsed.error.issues.map((issue) => issue.message).join("; ")
+              }`,
+              retryable: false,
+              cause: parsed.error,
+            };
+            traces.push({
+              stageIdentifier: identifier,
+              stageIndex: index,
+              stageStatus: "executed",
+              promptSnapshot: "",
+              inputContextSnapshot: {
+                initialContext,
+                stageInput,
+                priorStageOutputs: [...priorStageOutputs],
+              },
+              parsedJsonOutput: luaOutput,
+              luaScriptSnapshot: run.scriptText,
+              luaScriptPath: run.resolvedFilePath,
+              ...luaTelemetry,
+              error: executionError,
+              success: false,
+            });
+            return {
+              ok: false,
+              traces,
+              outputsByStage,
+              warnings,
+              stageStatuses,
+              dependencyGraph,
+              failedStage: {
+                stageIdentifier: identifier,
+                stageIndex: index,
+                error: executionError,
+              },
+            };
+          }
+          luaOutput = parsed.data;
+        }
+
+        const validationResult = validateStageValue(luaOutput, stage.validate);
+        if (
+          !validationResult.success &&
+          (stage.validate?.onFailure ?? "fail") === "fail"
+        ) {
+          const executionError: StageExecutionError = {
+            kind: "validator_mismatch",
+            stageIdentifier: identifier,
+            stageIndex: index,
+            message: validationResult.issues.map((issue) => issue.message).join(
+              "; ",
+            ),
+            retryable: false,
+            cause: validationResult.issues,
+          };
+          traces.push({
+            stageIdentifier: identifier,
+            stageIndex: index,
+            stageStatus: "executed",
+            promptSnapshot: "",
+            inputContextSnapshot: {
+              initialContext,
+              stageInput,
+              priorStageOutputs: [...priorStageOutputs],
+            },
+            parsedJsonOutput: luaOutput,
+            validationIssues: validationResult.issues,
+            luaScriptSnapshot: run.scriptText,
+            luaScriptPath: run.resolvedFilePath,
+            ...luaTelemetry,
+            error: executionError,
+            success: false,
+          });
+          return {
+            ok: false,
+            traces,
+            outputsByStage,
+            warnings,
+            stageStatuses,
+            dependencyGraph,
+            failedStage: {
+              stageIdentifier: identifier,
+              stageIndex: index,
+              error: executionError,
+            },
+          };
+        }
+
+        if (!validationResult.success) {
+          this.appendWarnings(
+            warnings,
+            ...validationResult.issues.map((issue) => ({
+              stageIdentifier: identifier,
+              stageIndex: index,
+              ...toValidatorWarning(issue),
+            })),
+          );
+        }
+
+        traces.push({
+          stageIdentifier: identifier,
+          stageIndex: index,
+          stageStatus: "executed",
+          promptSnapshot: "",
+          inputContextSnapshot: {
+            initialContext,
+            stageInput,
+            priorStageOutputs: [...priorStageOutputs],
+          },
+          parsedJsonOutput: luaOutput,
+          validationIssues: validationResult.success
+            ? undefined
+            : validationResult.issues,
+          luaScriptSnapshot: run.scriptText,
+          luaScriptPath: run.resolvedFilePath,
+          ...luaTelemetry,
+          success: true,
+        });
+        outputsByStage[identifier] = luaOutput;
+        priorStageOutputs.push({
+          stageIdentifier: identifier,
+          output: luaOutput,
+        });
+        continue;
+      }
+
       if (mode === "record_transform") {
         const source = stage.input?.source ??
           (index === 0 ? "pipeline_input" : "previous_stage");
@@ -1428,7 +1816,9 @@ export class StageExecutionEngine {
           };
         }
 
-        if (!stage.transform || stage.transform.kind !== "conversation_rewrite") {
+        if (
+          !stage.transform || stage.transform.kind !== "conversation_rewrite"
+        ) {
           const executionError: StageExecutionError = {
             kind: "invalid_record_transform_input",
             stageIdentifier: identifier,
@@ -1482,6 +1872,7 @@ export class StageExecutionEngine {
                 stage,
                 () => this.chatSession.fork(),
                 this.completionOptions,
+                this.workflowPath,
               );
               const recordValidationResult = validateStageValue(
                 rewriteResult.record,
@@ -1514,7 +1905,9 @@ export class StageExecutionEngine {
               kind: "invalid_record_transform_input",
               stageIdentifier: identifier,
               stageIndex: index,
-              message: item.error instanceof Error ? item.error.message : String(item.error),
+              message: item.error instanceof Error
+                ? item.error.message
+                : String(item.error),
               retryable: false,
               cause: item.error,
             };
@@ -1542,17 +1935,25 @@ export class StageExecutionEngine {
             };
           }
 
-          const { recordIndex, rewriteResult, recordValidationResult, inputContextSnapshot } = item;
+          const {
+            recordIndex,
+            rewriteResult,
+            recordValidationResult,
+            inputContextSnapshot,
+          } = item;
           transformedRecords[recordIndex] = rewriteResult.record;
 
-          if (!recordValidationResult.success &&
-            (stage.validate?.onFailure ?? "fail") === "fail") {
+          if (
+            !recordValidationResult.success &&
+            (stage.validate?.onFailure ?? "fail") === "fail"
+          ) {
             const executionError: StageExecutionError = {
               kind: "validator_mismatch",
               stageIdentifier: identifier,
               stageIndex: index,
               message: `Transformed record failed stage validators: ${
-                recordValidationResult.issues.map((issue) => issue.message).join("; ")
+                recordValidationResult.issues.map((issue) => issue.message)
+                  .join("; ")
               }`,
               retryable: false,
               cause: recordValidationResult.issues,
@@ -1600,7 +2001,9 @@ export class StageExecutionEngine {
 
           this.appendWarnings(
             warnings,
-            ...rewriteResult.warnings.map((warning: ConversationRewriteWarning) => ({
+            ...rewriteResult.warnings.map((
+              warning: ConversationRewriteWarning,
+            ) => ({
               stageIdentifier: identifier,
               stageIndex: index,
               recordIndex,
@@ -1657,9 +2060,9 @@ export class StageExecutionEngine {
                 stageIndex: index,
                 recordIndex,
                 ...toValidatorWarning(issue),
-                })),
-              );
-            }
+              })),
+            );
+          }
           this.emitProgress({
             stageIdentifier: identifier,
             stageIndex: index,
@@ -1714,7 +2117,8 @@ export class StageExecutionEngine {
         };
       }
 
-      const previousIdentifier = node.dependencies[node.dependencies.length - 1];
+      const previousIdentifier =
+        node.dependencies[node.dependencies.length - 1];
       if (!previousIdentifier) {
         const executionError: StageExecutionError = {
           kind: "invalid_iter_input",
@@ -1829,7 +2233,12 @@ export class StageExecutionEngine {
       );
 
       for (const item of iterRuns) {
-        traces.push(...item.run.traces.map((trace) => ({ ...trace, stageStatus: "executed" as const })));
+        traces.push(
+          ...item.run.traces.map((trace) => ({
+            ...trace,
+            stageStatus: "executed" as const,
+          })),
+        );
         if (!item.run.ok) {
           return {
             ok: false,
@@ -1844,7 +2253,8 @@ export class StageExecutionEngine {
               error: {
                 ...item.run.error,
                 stageIdentifier: identifier,
-                message: `Iter item ${item.itemIndex} failed: ${item.run.error.message}`,
+                message:
+                  `Iter item ${item.itemIndex} failed: ${item.run.error.message}`,
               },
             },
           };

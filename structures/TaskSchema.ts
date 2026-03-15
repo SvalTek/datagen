@@ -20,6 +20,7 @@ import { z } from "zod";
 
 export type PipelineReasoningMode = "off" | "think" | "openai";
 export type PipelineProvider = "openai" | "ollama";
+export type StructuredOutputMode = "object" | "json" | "json-array" | "off";
 
 export interface TurnExample {
   /** The input for the example, which can be a string or an array of strings. */
@@ -72,7 +73,7 @@ export interface Stage {
   /** OPTIONAL: Enables model reasoning/thinking mode for this stage. Defaults to false. */
   reasoning?: boolean;
   /** OPTIONAL: Execution mode for this stage. Defaults to "batch". */
-  mode?: "batch" | "iter" | "record_transform" | "workflow_delegate";
+  mode?: "batch" | "iter" | "record_transform" | "workflow_delegate" | "lua";
   /** OPTIONAL: Explicit stage dependencies by stage id/name/key. */
   dependsOn?: string[];
   /** OPTIONAL: Minimal conditional execution gate for this stage. */
@@ -80,6 +81,8 @@ export interface Stage {
     path: string;
     equals?: unknown;
     notEquals?: unknown;
+    any?: unknown[];
+    notAny?: unknown[];
   };
   /** OPTIONAL: Per-stage parallelism for iter and record_transform. Defaults to 1. */
   parallelism?: number;
@@ -97,6 +100,25 @@ export interface Stage {
     contentField: string;
     targetRoles: string[];
     includeOriginalTargetTurn?: boolean;
+    turnPreprocess?: {
+      source: "inline" | "file";
+      code?: string;
+      filePath?: string;
+      runtime?: {
+        functionTimeoutMs?: number;
+        openStandardLibs?: boolean;
+        injectObjects?: boolean;
+        enableProxy?: boolean;
+        traceAllocations?: boolean;
+      };
+    };
+    turnWhen?: {
+      path: string;
+      equals?: unknown;
+      notEquals?: unknown;
+      any?: unknown[];
+      notAny?: unknown[];
+    };
   };
 
   /** OPTIONAL: Delegated child-workflow execution config. */
@@ -109,6 +131,20 @@ export interface Stage {
     outputSelectPath?: string;
     onFailure?: "fail" | "warn";
     inheritParentCli?: "none" | "completion" | "all";
+  };
+
+  /** OPTIONAL: Lua execution config for lua stages. */
+  lua?: {
+    source: "inline" | "file";
+    code?: string;
+    filePath?: string;
+    runtime?: {
+      functionTimeoutMs?: number;
+      openStandardLibs?: boolean;
+      injectObjects?: boolean;
+      enableProxy?: boolean;
+      traceAllocations?: boolean;
+    };
   };
 
   /** OPTIONAL: Declarative typed schema for this stage output. */
@@ -290,6 +326,8 @@ export interface PipelineDocument {
   endpoint?: string;
   /** OPTIONAL: Provider selection. Defaults to openai when omitted. */
   provider?: PipelineProvider;
+  /** OPTIONAL: Structured-output strategy for constrained stages. Defaults to off when omitted. */
+  structuredOutputMode?: StructuredOutputMode;
   /** OPTIONAL: Transport-level reasoning protocol. Defaults to off when omitted. */
   reasoningMode?: PipelineReasoningMode;
   /** OPTIONAL: Environment variable name containing an API key for the endpoint. */
@@ -306,6 +344,16 @@ export interface PipelineDocument {
   input?: PipelineInput;
   /** OPTIONAL: Output directory where final JSONL is written. Defaults to ./output. */
   outputDir?: string;
+  /** OPTIONAL: Repeat the whole workflow run this many times. Defaults to 1. */
+  repeat?: number;
+  /** OPTIONAL: Workflow-level default Lua runtime options for lua stages. */
+  luaRuntime?: {
+    functionTimeoutMs?: number;
+    openStandardLibs?: boolean;
+    injectObjects?: boolean;
+    enableProxy?: boolean;
+    traceAllocations?: boolean;
+  };
   /** Ordered stage definitions that form the pipeline. */
   stages: Stage[];
 }
@@ -328,14 +376,66 @@ const StageWhenSchema = z.object({
   path: z.string().min(1),
   equals: z.unknown().optional(),
   notEquals: z.unknown().optional(),
+  any: z.array(z.unknown()).min(1).optional(),
+  notAny: z.array(z.unknown()).min(1).optional(),
 }).strict().superRefine((value, ctx) => {
   const operatorCount = Number(value.equals !== undefined) +
-    Number(value.notEquals !== undefined);
+    Number(value.notEquals !== undefined) +
+    Number(value.any !== undefined) +
+    Number(value.notAny !== undefined);
   if (operatorCount !== 1) {
     ctx.addIssue({
       code: "custom",
-      message: "stage.when requires exactly one of equals or notEquals",
+      message:
+        "stage.when requires exactly one of equals, notEquals, any, or notAny",
     });
+  }
+});
+
+const EmbeddedLuaSchema = z.object({
+  source: z.enum(["inline", "file"]),
+  code: z.string().min(1).optional(),
+  filePath: z.string().min(1).optional(),
+  runtime: z.object({
+    functionTimeoutMs: z.number().int().nonnegative().optional(),
+    openStandardLibs: z.boolean().optional(),
+    injectObjects: z.boolean().optional(),
+    enableProxy: z.boolean().optional(),
+    traceAllocations: z.boolean().optional(),
+  }).strict().optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.source === "inline") {
+    if (!value.code?.trim()) {
+      ctx.addIssue({
+        code: "custom",
+        message: "turnPreprocess.code is required when turnPreprocess.source is inline",
+        path: ["code"],
+      });
+    }
+    if (value.filePath !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message: "turnPreprocess.filePath is not allowed when turnPreprocess.source is inline",
+        path: ["filePath"],
+      });
+    }
+  }
+
+  if (value.source === "file") {
+    if (!value.filePath?.trim()) {
+      ctx.addIssue({
+        code: "custom",
+        message: "turnPreprocess.filePath is required when turnPreprocess.source is file",
+        path: ["filePath"],
+      });
+    }
+    if (value.code !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message: "turnPreprocess.code is not allowed when turnPreprocess.source is file",
+        path: ["code"],
+      });
+    }
   }
 });
 
@@ -346,6 +446,8 @@ export const ConversationRewriteTransformSchema = z.object({
   contentField: z.string().min(1),
   targetRoles: z.array(z.string().min(1)).min(1),
   includeOriginalTargetTurn: z.boolean().optional(),
+  turnPreprocess: EmbeddedLuaSchema.optional(),
+  turnWhen: StageWhenSchema.optional(),
 }).strict();
 
 export const WorkflowDelegateSchema = z.object({
@@ -358,12 +460,65 @@ export const WorkflowDelegateSchema = z.object({
   onFailure: z.enum(["fail", "warn"]).optional(),
   inheritParentCli: z.enum(["none", "completion", "all"]).optional(),
 }).strict().superRefine((value, ctx) => {
-  if ((value.outputFrom ?? "final_stage_output") === "stage_key" && !value.outputStageKey?.trim()) {
+  if (
+    (value.outputFrom ?? "final_stage_output") === "stage_key" &&
+    !value.outputStageKey?.trim()
+  ) {
     ctx.addIssue({
       code: "custom",
-      message: "delegate.outputStageKey is required when outputFrom is stage_key",
+      message:
+        "delegate.outputStageKey is required when outputFrom is stage_key",
       path: ["outputStageKey"],
     });
+  }
+});
+
+export const LuaRuntimeOptionsSchema = z.object({
+  functionTimeoutMs: z.number().int().nonnegative().optional(),
+  openStandardLibs: z.boolean().optional(),
+  injectObjects: z.boolean().optional(),
+  enableProxy: z.boolean().optional(),
+  traceAllocations: z.boolean().optional(),
+}).strict();
+
+export const LuaStageSchema = z.object({
+  source: z.enum(["inline", "file"]),
+  code: z.string().min(1).optional(),
+  filePath: z.string().min(1).optional(),
+  runtime: LuaRuntimeOptionsSchema.optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.source === "inline") {
+    if (!value.code?.trim()) {
+      ctx.addIssue({
+        code: "custom",
+        message: "lua.code is required when lua.source is inline",
+        path: ["code"],
+      });
+    }
+    if (value.filePath !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message: "lua.filePath is not allowed when lua.source is inline",
+        path: ["filePath"],
+      });
+    }
+  }
+
+  if (value.source === "file") {
+    if (!value.filePath?.trim()) {
+      ctx.addIssue({
+        code: "custom",
+        message: "lua.filePath is required when lua.source is file",
+        path: ["filePath"],
+      });
+    }
+    if (value.code !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message: "lua.code is not allowed when lua.source is file",
+        path: ["code"],
+      });
+    }
   }
 });
 
@@ -495,25 +650,29 @@ const ValidationRuleNotEqualToPathSchema = ValidationRuleBaseSchema.extend({
   scope: ValidationScopeSchema.optional(),
 });
 
-const ValidationRuleMaxSimilarityToPathSchema = ValidationRuleBaseSchema.extend({
-  kind: z.literal("max_similarity_to_path"),
-  otherPath: z.string().min(1),
-  threshold: z.number().min(0).max(1),
-  scope: ValidationScopeSchema.optional(),
-  similarity: z.object({
-    mode: z.enum(["fast", "detailed"]).optional(),
-  }).strict().optional(),
-});
+const ValidationRuleMaxSimilarityToPathSchema = ValidationRuleBaseSchema.extend(
+  {
+    kind: z.literal("max_similarity_to_path"),
+    otherPath: z.string().min(1),
+    threshold: z.number().min(0).max(1),
+    scope: ValidationScopeSchema.optional(),
+    similarity: z.object({
+      mode: z.enum(["fast", "detailed"]).optional(),
+    }).strict().optional(),
+  },
+);
 
-const ValidationRuleMinSimilarityToPathSchema = ValidationRuleBaseSchema.extend({
-  kind: z.literal("min_similarity_to_path"),
-  otherPath: z.string().min(1),
-  threshold: z.number().min(0).max(1),
-  scope: ValidationScopeSchema.optional(),
-  similarity: z.object({
-    mode: z.enum(["fast", "detailed"]).optional(),
-  }).strict().optional(),
-});
+const ValidationRuleMinSimilarityToPathSchema = ValidationRuleBaseSchema.extend(
+  {
+    kind: z.literal("min_similarity_to_path"),
+    otherPath: z.string().min(1),
+    threshold: z.number().min(0).max(1),
+    scope: ValidationScopeSchema.optional(),
+    similarity: z.object({
+      mode: z.enum(["fast", "detailed"]).optional(),
+    }).strict().optional(),
+  },
+);
 
 const ValidationRuleNotEqualToRefSchema = ValidationRuleBaseSchema.extend({
   kind: z.literal("not_equal_to_ref"),
@@ -643,13 +802,20 @@ export const StageSchema = z.object({
   history: z.string().optional(),
   examples: z.array(TurnExampleSchema).optional(),
   reasoning: z.boolean().optional(),
-  mode: z.enum(["batch", "iter", "record_transform", "workflow_delegate"]).optional(),
+  mode: z.enum([
+    "batch",
+    "iter",
+    "record_transform",
+    "workflow_delegate",
+    "lua",
+  ]).optional(),
   dependsOn: z.array(z.string().min(1)).min(1).optional(),
   when: StageWhenSchema.optional(),
   parallelism: z.number().int().min(1).optional(),
   input: StageInputSourceSchema,
   transform: ConversationRewriteTransformSchema.optional(),
   delegate: WorkflowDelegateSchema.optional(),
+  lua: LuaStageSchema.optional(),
   constrain: ConstrainSchemaNodeSchema.optional(),
   validate: StageValidateSchema,
   retry: StageRetrySchema,
@@ -686,6 +852,22 @@ export const StageSchema = z.object({
       path: ["delegate"],
     });
   }
+
+  if (value.mode === "lua" && !value.lua) {
+    ctx.addIssue({
+      code: "custom",
+      message: "lua stages require a lua block",
+      path: ["lua"],
+    });
+  }
+
+  if (value.mode !== "lua" && value.lua) {
+    ctx.addIssue({
+      code: "custom",
+      message: "lua is only supported for lua stages",
+      path: ["lua"],
+    });
+  }
 });
 
 export const PipelineInputSchema = z.object({
@@ -704,6 +886,7 @@ export const PipelineDocumentSchema = z.object({
   model: z.string().min(1).optional(),
   endpoint: z.string().min(1).optional(),
   provider: z.enum(["openai", "ollama"]).optional(),
+  structuredOutputMode: z.enum(["object", "json", "json-array", "off"]).optional(),
   reasoningMode: z.enum(["off", "think", "openai"]).optional(),
   apiKeyEnv: z.string().min(1).optional(),
   httpReferer: z.string().min(1).optional(),
@@ -712,6 +895,8 @@ export const PipelineDocumentSchema = z.object({
   temperature: z.number().optional(),
   input: PipelineInputSchema.optional(),
   outputDir: z.string().min(1).optional(),
+  repeat: z.number().int().min(1).optional(),
+  luaRuntime: LuaRuntimeOptionsSchema.optional(),
   stages: z.array(StageSchema).min(1),
 }).strict().superRefine((value, ctx) => {
   const seen = new Set<string>();
@@ -772,6 +957,33 @@ export const PipelineDocumentSchema = z.object({
         });
       }
     }
+
+    if (stage.mode === "lua") {
+      const source = stage.input?.source ??
+        (index > 0
+          ? "previous_stage"
+          : value.input
+          ? "pipeline_input"
+          : undefined);
+
+      if (source === "pipeline_input" && !value.input) {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "lua stages using pipeline_input require pipeline.input to be configured",
+          path: ["stages", index, "input", "source"],
+        });
+      }
+
+      if (source === "previous_stage" && index === 0) {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "first lua stage cannot use previous_stage without a dependency",
+          path: ["stages", index, "input", "source"],
+        });
+      }
+    }
   });
 });
 
@@ -781,4 +993,5 @@ export type PipelineInputConfig = z.infer<typeof PipelineInputSchema>;
 export type ValidationRuleInput = z.infer<typeof ValidationRuleSchema>;
 export type StageValidateInput = z.infer<typeof StageValidateSchema>;
 export type InputRemapInput = z.infer<typeof InputRemapSchema>;
+export type LuaRuntimeOptionsInput = z.infer<typeof LuaRuntimeOptionsSchema>;
 export type PipelineDocumentInput = z.infer<typeof PipelineDocumentSchema>;

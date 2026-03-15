@@ -1,0 +1,87 @@
+version: 1
+name: 02-input-remap-prefixed-iter
+description: >
+  Demonstrates input remap from raw prefixed strings, slicing, and iter normalization.
+
+model: qwen2.5-coder:14b
+provider: ollama
+endpoint: http://localhost:11434/
+outputDir: ./examples/outputs
+
+input:
+  # Source data example:
+  # [{"conversation":["user: hi","assistant: hello"]}, ...]
+  path: ./examples/data/prefixed-conversations.json
+  format: json
+  offset: 0
+  limit: 200
+  remap:
+    kind: prefixed_string_array
+    sourcePath: conversation
+    prefixes:
+      user: "user:"
+      assistant: "assistant:"
+      system: "system:"
+    outputPath: conversations
+    roleField: from
+    contentField: value
+    trimContent: true
+
+stages:
+  - id: extract_records
+    instructions: >
+      Return one JSON array where each item is:
+      {
+        "id": "string",
+        "summary": "short text",
+        "turnCount": number
+      }
+      Use pipeline input records as source.
+    input:
+      source: pipeline_input
+    constrain:
+      type: array
+      minItems: 1
+      items:
+        type: object
+        shape:
+          id:
+            type: string
+          summary:
+            type: string
+          turnCount:
+            type: number
+            min: 1
+
+  - id: normalize_item
+    mode: iter
+    dependsOn:
+      - extract_records
+    parallelism: 8
+    instructions: >
+      Normalize one item into:
+      {
+        "id": "...",
+        "canonicalSummary": "...",
+        "turnCount": number
+      }
+    retry:
+      enabled: true
+      maxAttempts: 2
+    constrain:
+      type: object
+      shape:
+        id:
+          type: string
+        canonicalSummary:
+          type: string
+          minLength: 3
+        turnCount:
+          type: number
+          min: 1
+    validate:
+      onFailure: warn
+      rules:
+        - path: canonicalSummary
+          kind: min_length
+          value: 3

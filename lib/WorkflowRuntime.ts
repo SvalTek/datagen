@@ -1,9 +1,7 @@
+import { loadPipelineFromFile } from "./PipelineLoader.ts";
 import {
-  loadPipelineFromFile,
-} from "./PipelineLoader.ts";
-import {
-  StageExecutionEngine,
   type DelegatedWorkflowResult,
+  StageExecutionEngine,
   type StageExecutionResult,
 } from "./StageExecutionEngine.ts";
 import {
@@ -12,10 +10,7 @@ import {
   type ChatSessionDebugHooks,
   type CompletionSettings,
 } from "./ChatSession.ts";
-import {
-  loadInputDataset,
-  streamInputDataset,
-} from "./InputDatasetLoader.ts";
+import { loadInputDataset, streamInputDataset } from "./InputDatasetLoader.ts";
 import { rewriteConversationRecord } from "./ConversationRewrite.ts";
 import { validateStageValue } from "./StageValidator.ts";
 import type { PipelineProvider } from "../structures/TaskSchema.ts";
@@ -104,7 +99,9 @@ function canUseStreamingRecordTransform(
   if (stages.length !== 1) return false;
   const stage = stages[0];
   if ((stage.mode ?? "batch") !== "record_transform") return false;
-  if (!stage.transform || stage.transform.kind !== "conversation_rewrite") return false;
+  if (!stage.transform || stage.transform.kind !== "conversation_rewrite") {
+    return false;
+  }
   return (stage.input?.source ?? "pipeline_input") === "pipeline_input";
 }
 
@@ -134,7 +131,10 @@ function ensureParentDir(path: string): Promise<void> {
   return Deno.mkdir(parent, { recursive: true }).catch(() => {});
 }
 
-function resolveApiKey(overrides: WorkflowRunOverrides, pipelineApiKeyEnv?: string): string | undefined {
+function resolveApiKey(
+  overrides: WorkflowRunOverrides,
+  pipelineApiKeyEnv?: string,
+): string | undefined {
   if (overrides.apiKey?.trim()) {
     return overrides.apiKey.trim();
   }
@@ -205,18 +205,29 @@ async function loadRunCheckpoint(path: string): Promise<RunCheckpoint> {
     throw new Error("Checkpoint file must contain a JSON object");
   }
   const candidate = parsed as Record<string, unknown>;
-  if (typeof candidate.pipelinePath !== "string" || candidate.pipelinePath.length === 0) {
+  if (
+    typeof candidate.pipelinePath !== "string" ||
+    candidate.pipelinePath.length === 0
+  ) {
     throw new Error("Checkpoint is missing pipelinePath");
   }
-  if (typeof candidate.stageIdentifier !== "string" || candidate.stageIdentifier.length === 0) {
+  if (
+    typeof candidate.stageIdentifier !== "string" ||
+    candidate.stageIdentifier.length === 0
+  ) {
     throw new Error("Checkpoint is missing stageIdentifier");
   }
-  if (!Number.isInteger(candidate.nextRecordOffset) || Number(candidate.nextRecordOffset) < 0) {
+  if (
+    !Number.isInteger(candidate.nextRecordOffset) ||
+    Number(candidate.nextRecordOffset) < 0
+  ) {
     throw new Error("Checkpoint is missing valid nextRecordOffset");
   }
   return {
     pipelinePath: candidate.pipelinePath,
-    inputPath: typeof candidate.inputPath === "string" ? candidate.inputPath : undefined,
+    inputPath: typeof candidate.inputPath === "string"
+      ? candidate.inputPath
+      : undefined,
     stageIdentifier: candidate.stageIdentifier,
     nextRecordOffset: Number(candidate.nextRecordOffset),
     outputJsonlPath: typeof candidate.outputJsonlPath === "string"
@@ -228,7 +239,10 @@ async function loadRunCheckpoint(path: string): Promise<RunCheckpoint> {
   };
 }
 
-async function writeRunCheckpoint(path: string, checkpoint: RunCheckpoint): Promise<void> {
+async function writeRunCheckpoint(
+  path: string,
+  checkpoint: RunCheckpoint,
+): Promise<void> {
   await ensureParentDir(path);
   await Deno.writeTextFile(path, JSON.stringify(checkpoint, null, 2));
 }
@@ -271,7 +285,9 @@ async function runStreamingRecordTransform(
     const recordIndex = processedCount;
     const inputContextSnapshot = {
       currentIterItem: record,
-      priorStageOutputs: [] as Array<{ stageIdentifier: string; output: unknown }>,
+      priorStageOutputs: [] as Array<
+        { stageIdentifier: string; output: unknown }
+      >,
     };
 
     const rewriteResult = await rewriteConversationRecord(
@@ -279,6 +295,7 @@ async function runStreamingRecordTransform(
       input.stage,
       () => input.chatSession.fork(),
       input.completionOptions,
+      input.pipelinePath,
     );
 
     const fatalRewriteWarning = rewriteResult.warnings.find((warning) =>
@@ -324,7 +341,10 @@ async function runStreamingRecordTransform(
       input.stage.validate,
       { skipInapplicablePaths: true },
     );
-    if (!recordValidationResult.success && (input.stage.validate?.onFailure ?? "fail") === "fail") {
+    if (
+      !recordValidationResult.success &&
+      (input.stage.validate?.onFailure ?? "fail") === "fail"
+    ) {
       const executionError = {
         kind: "validator_mismatch" as const,
         stageIdentifier: input.stageIdentifier,
@@ -369,7 +389,9 @@ async function runStreamingRecordTransform(
       promptSnapshot: "",
       inputContextSnapshot,
       parsedJsonOutput: rewriteResult.record,
-      validationIssues: recordValidationResult.success ? undefined : recordValidationResult.issues,
+      validationIssues: recordValidationResult.success
+        ? undefined
+        : recordValidationResult.issues,
       subtraces: rewriteResult.traces,
       success: true,
     });
@@ -472,7 +494,9 @@ function buildRunReport(
     inputFormat?: string;
     inputRecordCount?: number;
     outputJsonlPath: string;
+    repeatCount?: number;
     resumeFrom?: number;
+    completedRepeats?: number;
     processedCount?: number;
     remainingCount?: number;
     startedAt: Date;
@@ -493,7 +517,9 @@ function buildRunReport(
     inputFormat: input.inputFormat,
     inputRecordCount: input.inputRecordCount,
     outputJsonlPath: input.outputJsonlPath,
+    repeatCount: input.repeatCount,
     resumeFrom: input.resumeFrom,
+    completedRepeats: input.completedRepeats,
     processedCount: input.processedCount,
     remainingCount: input.remainingCount,
     startedAt: input.startedAt.toISOString(),
@@ -503,14 +529,128 @@ function buildRunReport(
   };
 }
 
-export async function executeWorkflowFile(input: ExecuteWorkflowFileInput): Promise<WorkflowRunSuccess> {
+function roundPct(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+function resolveTraceStageKey(
+  traceStageIdentifier: string,
+  knownStageKeys: Set<string>,
+): string {
+  if (knownStageKeys.has(traceStageIdentifier)) {
+    return traceStageIdentifier;
+  }
+
+  let candidate = traceStageIdentifier;
+  while (/\[\d+\]$/.test(candidate)) {
+    candidate = candidate.replace(/\[\d+\]$/, "");
+    if (knownStageKeys.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  return traceStageIdentifier;
+}
+
+function buildTraceSampleKey(
+  trace: Pick<StageExecutionResult["traces"][number], "stageIdentifier" | "repeatIndex">,
+): string {
+  return `${trace.repeatIndex ?? 0}::${trace.stageIdentifier}`;
+}
+
+function buildStageMeta(result: StageExecutionResult): NonNullable<StageExecutionResult["stageMeta"]> {
+  const knownStageKeys = new Set<string>([
+    ...Object.keys(result.stageStatuses),
+    ...Object.keys(result.dependencyGraph),
+    ...Object.keys(result.outputsByStage),
+  ]);
+  const stats = new Map<string, {
+    sampleCount: number;
+    successCount: number;
+    failureCount: number;
+    warningCount: number;
+  }>();
+
+  const ensure = (stageKey: string) => {
+    const existing = stats.get(stageKey);
+    if (existing) return existing;
+    const created = {
+      sampleCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      warningCount: 0,
+    };
+    stats.set(stageKey, created);
+    return created;
+  };
+
+  for (const stageKey of knownStageKeys) {
+    ensure(stageKey);
+  }
+
+  const finalTraceBySampleKey = new Map<string, StageExecutionResult["traces"][number]>();
+  for (const trace of result.traces) {
+    if (trace.stageStatus === "blocked" || trace.stageStatus === "skipped") {
+      continue;
+    }
+    finalTraceBySampleKey.set(buildTraceSampleKey(trace), trace);
+  }
+
+  for (const trace of finalTraceBySampleKey.values()) {
+    const stageKey = resolveTraceStageKey(trace.stageIdentifier, knownStageKeys);
+    const entry = ensure(stageKey);
+    entry.sampleCount += 1;
+    if (trace.success) {
+      entry.successCount += 1;
+    } else {
+      entry.failureCount += 1;
+    }
+  }
+
+  for (const warning of result.warnings) {
+    const stageKey = knownStageKeys.has(warning.stageIdentifier)
+      ? warning.stageIdentifier
+      : resolveTraceStageKey(warning.stageIdentifier, knownStageKeys);
+    ensure(stageKey).warningCount += 1;
+  }
+
+  return Object.fromEntries(
+    [...stats.entries()].map(([stageKey, entry]) => {
+      const denominator = entry.sampleCount > 0 ? entry.sampleCount : 1;
+      return [
+        stageKey,
+        {
+          ...entry,
+          successRatePct: roundPct((entry.successCount / denominator) * 100),
+          failureRatePct: roundPct((entry.failureCount / denominator) * 100),
+          warningRatePct: roundPct((entry.warningCount / denominator) * 100),
+        },
+      ];
+    }),
+  );
+}
+
+function writeOutputJsonl(
+  outputJsonlPath: string,
+  output: unknown,
+): Promise<void> {
+  return Deno.writeTextFile(outputJsonlPath, `${toJsonl(output)}\n`, {
+    append: true,
+  });
+}
+
+export async function executeWorkflowFile(
+  input: ExecuteWorkflowFileInput,
+): Promise<WorkflowRunSuccess> {
   const startedAt = new Date();
   const resolvedWorkflowPath = await Deno.realPath(input.pipelinePath);
   const pipeline = await loadPipelineFromFile(input.pipelinePath);
   const allowStreaming = input.allowStreaming ?? true;
   const writeArtifacts = input.writeArtifacts ?? true;
 
-  const checkpoint = input.overrides.resumePath ? await loadRunCheckpoint(input.overrides.resumePath) : undefined;
+  const checkpoint = input.overrides.resumePath
+    ? await loadRunCheckpoint(input.overrides.resumePath)
+    : undefined;
   if (checkpoint && checkpoint.pipelinePath !== input.pipelinePath) {
     throw new Error(
       `Checkpoint pipelinePath '${checkpoint.pipelinePath}' does not match requested pipeline '${input.pipelinePath}'`,
@@ -528,8 +668,13 @@ export async function executeWorkflowFile(input: ExecuteWorkflowFileInput): Prom
 
   const shouldUseStreamingPath = allowStreaming &&
     !!effectiveInput &&
-    (effectiveInput.readMode === "stream" || !!input.overrides.resumePath || !!input.overrides.checkpointEvery) &&
+    (effectiveInput.readMode === "stream" || !!input.overrides.resumePath ||
+      !!input.overrides.checkpointEvery) &&
     canUseStreamingRecordTransform(pipeline.stages);
+  const repeatCount = pipeline.repeat ?? 1;
+  if (shouldUseStreamingPath && repeatCount > 1) {
+    throw new Error("pipeline.repeat > 1 is not supported for streaming workflows");
+  }
   const loadedInput = shouldUseStreamingPath
     ? undefined
     : effectiveInput
@@ -560,35 +705,21 @@ export async function executeWorkflowFile(input: ExecuteWorkflowFileInput): Prom
     ["DATAGEN_X_TITLE"],
   );
   const taskName = resolveTaskName(pipeline.name, input.pipelinePath);
-  const outputDir = input.overrides.outputDir ?? pipeline.outputDir ?? "./output";
+  const outputDir = input.overrides.outputDir ?? pipeline.outputDir ??
+    "./output";
   if (writeArtifacts) {
     await Deno.mkdir(outputDir, { recursive: true });
   }
   const normalizedOutputDir = outputDir.replace(/[\\/]+$/, "");
   const outputJsonlPath = `${normalizedOutputDir}/${taskName}.jsonl`;
-  const reportPath = input.overrides.outputPath ?? `${normalizedOutputDir}/${taskName}.report.json`;
+  const reportPath = input.overrides.outputPath ??
+    `${normalizedOutputDir}/${taskName}.report.json`;
 
   const debugHooks: ChatSessionDebugHooks = input.showThoughts
     ? {
       onThoughts: (thoughts) => input.reporter?.onThoughts(thoughts),
     }
     : {};
-  const chatSession = new ChatSession(
-    model,
-    {
-      max_tokens: pipeline.maxTokens,
-      temperature: pipeline.temperature,
-      reasoning_mode: pipeline.reasoningMode ?? "off",
-    },
-    {
-      provider,
-      endpoint,
-      apiKey,
-      httpReferer,
-      xTitle,
-    } satisfies ChatSessionBackendOptions,
-    debugHooks,
-  );
 
   const delegation = input.delegation ?? {
     depth: 0,
@@ -596,86 +727,120 @@ export async function executeWorkflowFile(input: ExecuteWorkflowFileInput): Prom
     ancestryWorkflowPaths: [resolvedWorkflowPath],
   };
 
-  const engine = new StageExecutionEngine({
-    model,
-    chatSession,
-    globalParallelism: input.overrides.parallelism,
-    completionOptions: {
-      max_tokens: input.overrides.completionOptions?.max_tokens ?? pipeline.maxTokens,
-      temperature: input.overrides.completionOptions?.temperature ?? pipeline.temperature,
-      reasoning_mode: pipeline.reasoningMode ?? "off",
-    },
-    progress: {
-      onProgress: (event) => input.reporter?.onProgress(event),
-      onWarning: (warning) => input.reporter?.onWarning(warning),
-    },
-    runDelegatedWorkflow: async (request) => {
-      const baseDir = resolvedWorkflowPath.replace(/[\\/][^\\/]+$/, "");
-      const joinedPath = request.delegate.workflowPath.match(/^(?:[a-zA-Z]:)?[\\/]/)
-        ? request.delegate.workflowPath
-        : `${baseDir}/${request.delegate.workflowPath}`;
-      const resolvedChildPath = await Deno.realPath(joinedPath);
-      if (delegation.ancestryWorkflowPaths.includes(resolvedChildPath)) {
-        throw new Error(`Delegation cycle detected for workflow '${resolvedChildPath}'`);
-      }
-      if (delegation.depth + 1 > delegation.maxDepth) {
-        throw new Error(`Delegation max depth ${delegation.maxDepth} exceeded at '${resolvedChildPath}'`);
-      }
+  const buildChatSession = () =>
+    new ChatSession(
+      model,
+      {
+        max_tokens: pipeline.maxTokens,
+        temperature: pipeline.temperature,
+        reasoning_mode: pipeline.reasoningMode ?? "off",
+      },
+      {
+        provider,
+        endpoint,
+        apiKey,
+        httpReferer,
+        xTitle,
+        structuredOutputMode: pipeline.structuredOutputMode,
+      } satisfies ChatSessionBackendOptions,
+      debugHooks,
+    );
 
-      const inheritMode = request.delegate.inheritParentCli ?? "none";
-      const childOverrides: WorkflowRunOverrides = (() => {
-        if (inheritMode === "all") {
-          return {
-            ...input.overrides,
-            outputPath: undefined,
-            outputDir: undefined,
-            resumePath: undefined,
-            checkpointEvery: undefined,
-          };
+  const buildEngine = (chatSession: ChatSession) =>
+    new StageExecutionEngine({
+      model,
+      workflowPath: resolvedWorkflowPath,
+      luaRuntimeDefaults: pipeline.luaRuntime,
+      chatSession,
+      globalParallelism: input.overrides.parallelism,
+      completionOptions: {
+        max_tokens: input.overrides.completionOptions?.max_tokens ??
+          pipeline.maxTokens,
+        temperature: input.overrides.completionOptions?.temperature ??
+          pipeline.temperature,
+        reasoning_mode: pipeline.reasoningMode ?? "off",
+      },
+      progress: {
+        onProgress: (event) => input.reporter?.onProgress(event),
+        onWarning: (warning) => input.reporter?.onWarning(warning),
+      },
+      runDelegatedWorkflow: async (request) => {
+        const baseDir = resolvedWorkflowPath.replace(/[\\/][^\\/]+$/, "");
+        const joinedPath =
+          request.delegate.workflowPath.match(/^(?:[a-zA-Z]:)?[\\/]/)
+            ? request.delegate.workflowPath
+            : `${baseDir}/${request.delegate.workflowPath}`;
+        const resolvedChildPath = await Deno.realPath(joinedPath);
+        if (delegation.ancestryWorkflowPaths.includes(resolvedChildPath)) {
+          throw new Error(
+            `Delegation cycle detected for workflow '${resolvedChildPath}'`,
+          );
         }
-        if (inheritMode === "completion") {
-          return {
-            completionOptions: input.overrides.completionOptions,
-            parallelism: input.overrides.parallelism,
-          };
+        if (delegation.depth + 1 > delegation.maxDepth) {
+          throw new Error(
+            `Delegation max depth ${delegation.maxDepth} exceeded at '${resolvedChildPath}'`,
+          );
         }
-        return {};
-      })();
 
-      const childRun = await executeWorkflowFile({
-        pipelinePath: resolvedChildPath,
-        overrides: childOverrides,
-        initialContext: (request.delegate.inputAs ?? "initial_context") === "initial_context"
-          ? request.mappedInput
-          : undefined,
-        pipelineInputRecordsOverride: (request.delegate.inputAs ?? "initial_context") === "pipeline_input"
-          ? request.mappedInput as unknown[]
-          : undefined,
-        reporter: undefined,
-        showThoughts: false,
-        allowStreaming: false,
-        writeArtifacts: false,
-        delegation: {
-          depth: delegation.depth + 1,
-          maxDepth: delegation.maxDepth,
-          ancestryWorkflowPaths: [...delegation.ancestryWorkflowPaths, resolvedChildPath],
-        },
-      });
+        const inheritMode = request.delegate.inheritParentCli ?? "none";
+        const childOverrides: WorkflowRunOverrides = (() => {
+          if (inheritMode === "all") {
+            return {
+              ...input.overrides,
+              outputPath: undefined,
+              outputDir: undefined,
+              resumePath: undefined,
+              checkpointEvery: undefined,
+            };
+          }
+          if (inheritMode === "completion") {
+            return {
+              completionOptions: input.overrides.completionOptions,
+              parallelism: input.overrides.parallelism,
+            };
+          }
+          return {};
+        })();
 
-      const delegatedResult: DelegatedWorkflowResult = {
-        ok: childRun.result.ok,
-        workflowPath: request.delegate.workflowPath,
-        resolvedWorkflowPath: resolvedChildPath,
-        durationMs: childRun.durationMs,
-        model: childRun.model,
-        provider: childRun.provider,
-        endpoint: childRun.endpoint,
-        result: childRun.result,
-        finalStageKey: childRun.finalStageKey,
-      };
-      return delegatedResult;
-    },
-  });
+        const childRun = await executeWorkflowFile({
+          pipelinePath: resolvedChildPath,
+          overrides: childOverrides,
+          initialContext:
+            (request.delegate.inputAs ?? "initial_context") === "initial_context"
+              ? request.mappedInput
+              : undefined,
+          pipelineInputRecordsOverride:
+            (request.delegate.inputAs ?? "initial_context") === "pipeline_input"
+              ? request.mappedInput as unknown[]
+              : undefined,
+          reporter: undefined,
+          showThoughts: false,
+          allowStreaming: false,
+          writeArtifacts: false,
+          delegation: {
+            depth: delegation.depth + 1,
+            maxDepth: delegation.maxDepth,
+            ancestryWorkflowPaths: [
+              ...delegation.ancestryWorkflowPaths,
+              resolvedChildPath,
+            ],
+          },
+        });
+
+        const delegatedResult: DelegatedWorkflowResult = {
+          ok: childRun.result.ok,
+          workflowPath: request.delegate.workflowPath,
+          resolvedWorkflowPath: resolvedChildPath,
+          durationMs: childRun.durationMs,
+          model: childRun.model,
+          provider: childRun.provider,
+          endpoint: childRun.endpoint,
+          result: childRun.result,
+          finalStageKey: childRun.finalStageKey,
+        };
+        return delegatedResult;
+      },
+    });
 
   input.reporter?.startRun({
     pipelineName: pipeline.name,
@@ -698,28 +863,95 @@ export async function executeWorkflowFile(input: ExecuteWorkflowFileInput): Prom
       stageIdentifier: stageIdentifier(pipeline.stages[0], 0),
       stageIndex: 0,
       inputRecords: streamInputDataset(effectiveInput!),
-      chatSession,
+      chatSession: buildChatSession(),
       completionOptions: {
-        max_tokens: input.overrides.completionOptions?.max_tokens ?? pipeline.maxTokens,
-        temperature: input.overrides.completionOptions?.temperature ?? pipeline.temperature,
+        max_tokens: input.overrides.completionOptions?.max_tokens ??
+          pipeline.maxTokens,
+        temperature: input.overrides.completionOptions?.temperature ??
+          pipeline.temperature,
         reasoning_mode: pipeline.reasoningMode ?? "off",
       },
       reporter: input.reporter,
       outputJsonlPath,
       appendOutput: Boolean(input.overrides.resumePath),
-      checkpointPath: input.overrides.checkpointEvery ? checkpointPath : undefined,
+      checkpointPath: input.overrides.checkpointEvery
+        ? checkpointPath
+        : undefined,
       checkpointEvery: input.overrides.checkpointEvery,
       checkpointBaseOffset: effectiveInput?.offset ?? 0,
       pipelinePath: input.pipelinePath,
       inputPath: effectiveInput?.path,
       writeArtifacts,
     })
-    : await engine.executeStages(
-      pipeline.stages,
-      input.initialContext,
-      input.pipelineInputRecordsOverride ?? loadedInput?.records,
-    );
+    : await (async () => {
+      if (repeatCount <= 1) {
+        return await buildEngine(buildChatSession()).executeStages(
+          pipeline.stages,
+          input.initialContext,
+          input.pipelineInputRecordsOverride ?? loadedInput?.records,
+        );
+      }
+
+      const aggregatedOutputsByStage: Record<string, unknown[]> = {};
+      const aggregatedWarnings: StageExecutionResult["warnings"] = [];
+      const aggregatedTraces: StageExecutionResult["traces"] = [];
+      let lastIterationResult: StageExecutionResult | undefined;
+
+      for (let repeatIndex = 0; repeatIndex < repeatCount; repeatIndex++) {
+        const iterationEngine = buildEngine(buildChatSession());
+        const iterationResult = await iterationEngine.executeStages(
+          pipeline.stages,
+          input.initialContext,
+          input.pipelineInputRecordsOverride ?? loadedInput?.records,
+        );
+
+        aggregatedTraces.push(
+          ...iterationResult.traces.map((trace) => ({
+            ...trace,
+            repeatIndex: repeatIndex + 1,
+          })),
+        );
+        aggregatedWarnings.push(
+          ...iterationResult.warnings.map((warning) => ({
+            ...warning,
+            repeatIndex: repeatIndex + 1,
+          })),
+        );
+
+        for (const [stageKey, stageOutput] of Object.entries(iterationResult.outputsByStage)) {
+          (aggregatedOutputsByStage[stageKey] ??= []).push(stageOutput);
+        }
+
+        lastIterationResult = iterationResult;
+        if (!iterationResult.ok) {
+          return {
+            ok: false,
+            traces: aggregatedTraces,
+            outputsByStage: aggregatedOutputsByStage,
+            warnings: aggregatedWarnings,
+            stageStatuses: iterationResult.stageStatuses,
+            dependencyGraph: iterationResult.dependencyGraph,
+            failedStage: iterationResult.failedStage
+              ? {
+                ...iterationResult.failedStage,
+                repeatIndex: repeatIndex + 1,
+              }
+              : undefined,
+          } satisfies StageExecutionResult;
+        }
+      }
+
+      return {
+        ok: true,
+        traces: aggregatedTraces,
+        outputsByStage: aggregatedOutputsByStage,
+        warnings: aggregatedWarnings,
+        stageStatuses: lastIterationResult?.stageStatuses ?? {},
+        dependencyGraph: lastIterationResult?.dependencyGraph ?? {},
+      } satisfies StageExecutionResult;
+    })();
   const endedAt = new Date();
+  result.stageMeta = buildStageMeta(result);
 
   const lastStage = pipeline.stages[pipeline.stages.length - 1];
   const lastStageKey = stageIdentifier(
@@ -729,7 +961,14 @@ export async function executeWorkflowFile(input: ExecuteWorkflowFileInput): Prom
 
   if (result.ok && !shouldUseStreamingPath && writeArtifacts) {
     const finalOutput = result.outputsByStage[lastStageKey];
-    await Deno.writeTextFile(outputJsonlPath, `${toJsonl(finalOutput)}\n`);
+    if (repeatCount > 1 && Array.isArray(finalOutput)) {
+      await Deno.writeTextFile(outputJsonlPath, "");
+      for (const repeatOutput of finalOutput) {
+        await writeOutputJsonl(outputJsonlPath, repeatOutput);
+      }
+    } else {
+      await Deno.writeTextFile(outputJsonlPath, `${toJsonl(finalOutput)}\n`);
+    }
   }
 
   const report = buildRunReport({
@@ -741,20 +980,32 @@ export async function executeWorkflowFile(input: ExecuteWorkflowFileInput): Prom
     inputPath: effectiveInput?.path,
     inputFormat: loadedInput?.format,
     inputRecordCount: shouldUseStreamingPath
-      ? (result as StageExecutionResult & { processedCount?: number }).processedCount
+      ? (result as StageExecutionResult & { processedCount?: number })
+        .processedCount
       : loadedInput?.records.length,
     outputJsonlPath,
+    repeatCount,
     resumeFrom: shouldUseStreamingPath ? effectiveInput?.offset : undefined,
+    completedRepeats: shouldUseStreamingPath
+      ? undefined
+      : result.ok
+      ? repeatCount
+      : result.failedStage?.repeatIndex
+      ? result.failedStage.repeatIndex - 1
+      : 0,
     processedCount: shouldUseStreamingPath
-      ? (result as StageExecutionResult & { processedCount?: number }).processedCount
+      ? (result as StageExecutionResult & { processedCount?: number })
+        .processedCount
       : loadedInput?.records.length,
-    remainingCount: shouldUseStreamingPath && effectiveInput?.limit !== undefined
-      ? Math.max(
-        0,
-        effectiveInput.limit -
-          ((result as StageExecutionResult & { processedCount?: number }).processedCount ?? 0),
-      )
-      : undefined,
+    remainingCount:
+      shouldUseStreamingPath && effectiveInput?.limit !== undefined
+        ? Math.max(
+          0,
+          effectiveInput.limit -
+            ((result as StageExecutionResult & { processedCount?: number })
+              .processedCount ?? 0),
+        )
+        : undefined,
     startedAt,
     endedAt,
     result,

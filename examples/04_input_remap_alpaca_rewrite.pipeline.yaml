@@ -1,0 +1,53 @@
+version: 1
+name: 04-input-remap-alpaca-rewrite
+description: >
+  Demonstrates Alpaca remap + record_transform rewrite.
+
+model: qwen2.5-coder:14b
+provider: ollama
+endpoint: http://localhost:11434/
+outputDir: ./examples/outputs
+
+input:
+  # Source data shape:
+  # {"instruction":"...","input":"...","output":"..."}
+  path: ./examples/data/alpaca-like.jsonl
+  format: jsonl
+  remap:
+    kind: alpaca
+    # These are optional defaults shown explicitly for clarity.
+    instructionField: instruction
+    inputField: input
+    outputField: output
+    outputPath: conversations
+    roleField: from
+    contentField: value
+
+stages:
+  - id: rewrite_output_turn
+    mode: record_transform
+    instructions: >
+      Rewrite assistant output to be concise and high signal.
+      Keep core meaning.
+    transform:
+      kind: conversation_rewrite
+      conversationsPath: conversations
+      roleField: from
+      contentField: value
+      targetRoles:
+        - assistant
+    retry:
+      enabled: true
+      maxAttempts: 2
+    validate:
+      onFailure: warn
+      rules:
+        - path: content
+          kind: min_similarity_to_ref
+          ref: original_target_content
+          threshold: 0.45
+          similarity:
+            mode: detailed
+        - path: content
+          kind: must_change_from_ref
+          ref: original_target_content

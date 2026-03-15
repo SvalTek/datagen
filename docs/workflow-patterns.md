@@ -1,25 +1,26 @@
 # Workflow Patterns (Getting Started)
 
-This guide is for people who already understand datasets/training, but are new to **Datagen workflows**.
+This guide is for people who already understand datasets/training, but are new
+to **Datagen workflows**.
 
-The goal is to help you read and write workflows confidently, and understand why each block exists.
+The goal is to help you read and write workflows confidently, and understand why
+each block exists.
 
-For full schema detail, see [Workflow Reference](./workflow-reference.md).
-For CLI flags, see [CLI Reference](./cli-reference.md).
-For advanced graph behavior, see [Branching Workflows](./branching_workflows.md).
+For full schema detail, see [Workflow Reference](./workflow-reference.md). For
+CLI flags, see [CLI Reference](./cli-reference.md). For advanced graph behavior,
+see [Branching Workflows](./branching_workflows.md).
 
 ## How To Read A Datagen Workflow
 
 When you open a workflow file, read it in this order:
 
-1. Runtime block (`model`, `provider`, `endpoint`)
+1. Runtime block (`model`, `provider`, `endpoint`, `structuredOutputMode`, `repeat`)
 2. Input block (`input`) if present
 3. Stage list (`stages`) and each stage `mode`
 4. Quality guards (`constrain`, `validate`, `retry`)
 5. Execution controls (`dependsOn`, `when`, `parallelism`)
 
-> **Why this order?**
-> It mirrors Datagen execution order.
+> **Why this order?** It mirrors Datagen execution order.
 
 ---
 
@@ -49,15 +50,16 @@ What this teaches:
 - `batch` mode is implied when `mode` is omitted.
 - Datagen expects valid JSON stage output.
 
-> **Callout: `id` vs `name`**
-> `id` is the stable stage key for dependencies/reporting.
-> You can keep `name` for readability if you want, but `id` is the reliable reference key.
+> **Callout: `id` vs `name`** `id` is the stable stage key for
+> dependencies/reporting. You can keep `name` for readability if you want, but
+> `id` is the reliable reference key.
 
 ---
 
 ## Pattern 2: Seed Then Normalize (`batch` -> `iter`)
 
-Use this when stage 1 creates an array, and stage 2 should process each item individually.
+Use this when stage 1 creates an array, and stage 2 should process each item
+individually.
 
 ```yaml
 stages:
@@ -81,16 +83,15 @@ What this teaches:
 - Each iter call should return **one object**.
 - `parallelism` speeds up per-item stages.
 
-> **Callout: `parallelism`**
-> Start small (`2-4`) and increase carefully.
-> Higher values can hit backend/model throughput limits.
+> **Callout: `parallelism`** Start small (`2-4`) and increase carefully. Higher
+> values can hit backend/model throughput limits.
 
 ## `iter` Mode Explained Properly
 
 ### What it is
 
-`iter` is a loop stage.
-Datagen runs one model call per item from an input array.
+`iter` is a loop stage. Datagen runs one model call per item from an input
+array.
 
 ### What it receives
 
@@ -100,7 +101,8 @@ For each item, Datagen gives the stage:
 - initial context (if provided)
 - relevant prior stage outputs
 
-This means your instructions should be phrased for **one item at a time**, not the whole dataset.
+This means your instructions should be phrased for **one item at a time**, not
+the whole dataset.
 
 ### What it must return
 
@@ -216,9 +218,15 @@ What this teaches:
 
 - `constrain` is for structure/types/ranges.
 - It is stronger than prompt wording alone.
+- top-level `structuredOutputMode` decides how Datagen obtains constrained
+  output from the backend:
+  - `object`: provider/schema-based structured generation
+  - `json`: backend JSON-object mode + local validation
+  - `json-array`: backend JSON-object mode + strip one outer array wrapper + local validation
+  - `off`: prompt/text generation + local validation
 
-> **Callout: Use `constrain` early**
-> If a stage output has a known schema, add `constrain` sooner rather than later.
+> **Callout: Use `constrain` early** If a stage output has a known schema, add
+> `constrain` sooner rather than later.
 
 ---
 
@@ -253,15 +261,15 @@ What this teaches:
 - `validate` checks meaning/quality constraints.
 - `retry` gives the model another chance with feedback.
 
-> **Callout: `constrain` and `validate` are different**
-> `constrain` = shape/type correctness.
-> `validate` = semantic/content correctness.
+> **Callout: `constrain` and `validate` are different** `constrain` = shape/type
+> correctness. `validate` = semantic/content correctness.
 
 ---
 
 ## Pattern 5: Conversation Rewrite (`record_transform`)
 
-Use this when each input record contains a conversation and you want turn-level rewriting.
+Use this when each input record contains a conversation and you want turn-level
+rewriting.
 
 ```yaml
 input:
@@ -292,15 +300,15 @@ What this teaches:
 - `conversation_rewrite` targets selected roles in a turn array.
 - Rewrite output contract is raw text (not JSON wrapper).
 
-> **Callout: Most common failure in rewrite workflows**
-> Prompt asks for JSON while runtime expects raw rewritten turn text.
+> **Callout: Most common failure in rewrite workflows** Prompt asks for JSON
+> while runtime expects raw rewritten turn text.
 
 ## `record_transform` Mode Explained Properly
 
 ### What it is
 
-`record_transform` is a record-by-record transform stage.
-Datagen takes one input record, transforms it, and emits one output record.
+`record_transform` is a record-by-record transform stage. Datagen takes one
+input record, transforms it, and emits one output record.
 
 ### What it receives
 
@@ -310,7 +318,8 @@ Per record, Datagen passes:
 - stage + transform configuration
 - model context needed for that record
 
-Unlike `iter`, this mode is designed for structured record rewrites (especially conversations).
+Unlike `iter`, this mode is designed for structured record rewrites (especially
+conversations).
 
 ### What it must return
 
@@ -339,6 +348,17 @@ transform:
   targetRoles:
     - assistant
   includeOriginalTargetTurn: true
+  turnPreprocess:
+    source: inline
+    code: |
+      local ctx = ...
+      local turn = Datagen.clone(ctx.turn)
+      local text = Datagen.get(turn, "text", "")
+      turn.length_class = (#text <= 500) and "short" or "long"
+      return turn
+  turnWhen:
+    path: length_class
+    equals: short
 ```
 
 What each one does:
@@ -347,7 +367,25 @@ What each one does:
 - `roleField`: field that identifies speaker role
 - `contentField`: field containing turn text
 - `targetRoles`: only these turns are rewritten
-- `includeOriginalTargetTurn`: include current original target turn in prompt context
+- `includeOriginalTargetTurn`: include current original target turn in prompt
+  context
+- `turnPreprocess`: optional Lua hook that can annotate/mutate each target turn
+  before rewrite
+- `turnWhen`: optional gate evaluated against the preprocessed target turn so
+  only matching turns are rewritten
+
+`turnWhen` supports:
+
+- `equals`
+- `notEquals`
+- `any`
+- `notAny`
+
+Example use:
+
+- classify each assistant turn as `short` or `long`
+- add that field directly onto the turn object
+- rewrite only the `short` ones while preserving the full conversation record
 
 ### Input source behavior
 
@@ -395,7 +433,8 @@ In those cases, use `batch` or `iter`.
 1. Wrong `conversationsPath` or wrong role/content field names.
 2. Asking for JSON output in rewrite instructions.
 3. Using transform mode on records that were never remapped into turn objects.
-4. Forgetting `input.source` in multi-stage transform pipelines and accidentally reading wrong source.
+4. Forgetting `input.source` in multi-stage transform pipelines and accidentally
+   reading wrong source.
 
 ### Reliability template
 
@@ -510,9 +549,9 @@ What this teaches:
 - `when` conditionally skips a stage.
 - Downstream dependency behavior is visible in run traces/report.
 
-> **Where does `when.path` data come from?**
-> From `initialContext` or previous stage outputs (`outputsByStage`).
-> If you reference `outputsByStage.seed.isEligible`, your `seed` stage must produce `isEligible`.
+> **Where does `when.path` data come from?** From `initialContext` or previous
+> stage outputs (`outputsByStage`). If you reference
+> `outputsByStage.seed.isEligible`, your `seed` stage must produce `isEligible`.
 
 Example of producing a condition flag explicitly:
 
@@ -577,6 +616,41 @@ What this teaches:
 
 ---
 
+## Pattern 9: Deterministic Lua Stage
+
+Use `mode: lua` when you need deterministic scripted logic between model stages.
+
+```yaml
+stages:
+  - id: seed
+    instructions: Return one JSON object with records.
+
+  - id: compute_flags
+    mode: lua
+    dependsOn: [seed]
+    instructions: Compute deterministic flags from seed output.
+    lua:
+      source: inline
+      code: |
+        local ctx = ...
+        local seed = ctx.stageInput or {}
+        local records = seed.records or {}
+        return {
+          recordCount = #records,
+          shouldRunAudit = #records >= 100
+        }
+```
+
+What this teaches:
+
+- Lua stages run once and return one stage output.
+- Lua stages can consume `previous_stage` outputs via `ctx.stageInput`.
+- Lua output still supports `constrain` and `validate`.
+
+Use Lua for deterministic transforms and branch gating, not generation.
+
+---
+
 ## Practical Build Flow
 
 Use this progression when authoring a new workflow:
@@ -599,4 +673,5 @@ If a run behaves unexpectedly:
 1. Run with `--console warnings`.
 2. Open the generated report (`*.report.json`).
 3. Check stage id/mode, stage status, and validation issues.
-4. Fix one thing at a time (prompt contract, then validator rule, then retry behavior).
+4. Fix one thing at a time (prompt contract, then validator rule, then retry
+   behavior).

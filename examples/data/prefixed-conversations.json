@@ -1,0 +1,21 @@
+[
+  {
+    "conversation": [
+      "system: Keep replies concise.",
+      "user: Explain retries in two sentences.",
+      "assistant: Retries give a model another chance after a validation or parsing failure."
+    ]
+  },
+  {
+    "conversation": [
+      "user: Summarize DAG execution.",
+      "assistant: A DAG lets stages branch and merge without forcing every workflow into one linear chain."
+    ]
+  },
+  {
+    "conversation": [
+      "user: Why stream JSONL inputs?",
+      "assistant: Streaming avoids loading the whole dataset into memory during long record-transform runs."
+    ]
+  }
+]

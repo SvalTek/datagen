@@ -1,0 +1,50 @@
+version: 1
+name: 03-record-transform-stream
+description: >
+  Demonstrates stream-friendly conversation rewrite.
+  Use with --checkpoint-every and --resume for long-running jobs.
+
+model: qwen2.5-coder:14b
+provider: ollama
+endpoint: http://localhost:11434/
+outputDir: ./examples/outputs
+maxTokens: 1200
+temperature: 0.6
+
+input:
+  path: ./examples/data/sharegpt-like.jsonl
+  format: jsonl
+  # stream mode is optimized for JSONL and record_transform-compatible shape.
+  readMode: stream
+  offset: 0
+  limit: 10000
+
+stages:
+  - id: rewrite_assistant_turns
+    mode: record_transform
+    # First record_transform stage defaults to pipeline_input.
+    instructions: >
+      Rewrite assistant turns for clarity and safety.
+      Preserve intent and factual meaning.
+    transform:
+      kind: conversation_rewrite
+      conversationsPath: conversations
+      roleField: from
+      contentField: value
+      targetRoles:
+        - assistant
+      includeOriginalTargetTurn: true
+    retry:
+      enabled: true
+      maxAttempts: 2
+    validate:
+      onFailure: warn
+      rules:
+        - name: non_empty
+          path: content
+          kind: min_length
+          value: 3
+        - name: changed_from_original
+          path: content
+          kind: must_change_from_ref
+          ref: original_target_content

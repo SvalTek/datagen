@@ -1,0 +1,420 @@
+version: 1
+name: 07-lua-bindings-triage
+description: >
+  Realistic support-triage pipeline combining deterministic Lua data shaping,
+  Lua-driven model calls, conditional escalation routing, and iter-based reply
+  drafting.
+
+model: llama3.2:latest
+provider: ollama
+endpoint: http://localhost:11434/
+outputDir: ./examples/outputs
+luaRuntime:
+  functionTimeoutMs: 2000
+  openStandardLibs: true
+  injectObjects: true
+  enableProxy: true
+  traceAllocations: false
+
+input:
+  path: ./examples/data/07_support_tickets.json
+  format: json
+  offset: 0
+  limit: 200
+
+stages:
+  - id: preprocess_tickets
+    mode: lua
+    instructions: >
+      Normalize pipeline input tickets, emit quality warnings, and return
+      deterministic stats.
+    input:
+      source: pipeline_input
+    lua:
+      source: file
+      filePath: ./lua/07_preprocess_tickets.lua
+    constrain:
+      type: object
+      shape:
+        tickets:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            shape:
+              id:
+                type: string
+              title:
+                type: string
+              body:
+                type: string
+              product:
+                type: string
+              productLabel:
+                type: string
+              priorityHint:
+                type: string
+              slug:
+                type: string
+        stats:
+          type: object
+          shape:
+            inputCount:
+              type: number
+            highHintCount:
+              type: number
+            missingContentCount:
+              type: number
+        audit:
+          type: object
+          shape:
+            source:
+              type: string
+            stage:
+              type: string
+
+  - id: classify_tickets
+    mode: lua
+    dependsOn: [preprocess_tickets]
+    instructions: >
+      For each ticket, generate a short summary and a structured routing
+      decision through Lua LLM bindings.
+    lua:
+      source: inline
+      code: |
+        local ctx = ...
+        local inputData = ctx.stageInput or {}
+        local tickets = Datagen.get(inputData, "tickets", {})
+        local triaged = {}
+        local highPriorityCount = 0
+
+        for i = 1, #tickets do
+          local ticket = tickets[i]
+
+          local summaryPrompt = Datagen.textTemplate(
+            "Summarize this support ticket in one short sentence.\nTitle: {title}\nBody: {body}",
+            { title = ticket.title, body = ticket.body }
+          )
+          local summary = LLM.generate(summaryPrompt, {
+            max_tokens = 80,
+            temperature = 0.2,
+            reasoning_mode = "think",
+            think = false
+          })
+
+          local routePrompt = Datagen.textTemplate(
+            "Return JSON object only with keys priority, team, rationale.\npriority must be one of low|medium|high.\nteam must be one of billing|product|support.\nTicket title: {title}\nTicket body: {body}\nPriority hint: {hint}",
+            {
+              title = ticket.title,
+              body = ticket.body,
+              hint = ticket.priorityHint
+            }
+          )
+          local decision = LLM.generateObject(routePrompt, {
+            max_tokens = 120,
+            temperature = 0,
+            reasoning_mode = "think",
+            think = false
+          })
+
+          local priority = Datagen.lower(Datagen.get(decision, "priority", "medium"))
+          local team = Datagen.lower(Datagen.get(decision, "team", "support"))
+          local rationale = Datagen.trim(Datagen.get(decision, "rationale", ""))
+          local summaryClean = Datagen.trim(summary)
+
+          local base = {
+            id = ticket.id,
+            slug = ticket.slug,
+            title = ticket.title,
+            body = ticket.body,
+            product = ticket.product,
+            analysis = {
+              summary = "",
+              priority = "",
+              team = "",
+              rationale = ""
+            }
+          }
+          local withSummary = Datagen.set(base, "analysis.summary", summaryClean)
+          local withPriority = Datagen.set(withSummary, "analysis.priority", priority)
+          local withTeam = Datagen.set(withPriority, "analysis.team", team)
+          local enriched = Datagen.set(withTeam, "analysis.rationale", rationale)
+
+          if priority == "high" then
+            highPriorityCount = highPriorityCount + 1
+            Datagen.emitWarning(
+              "lua.triage.high_priority",
+              Datagen.textTemplate("ticket {id} classified as high priority", { id = ticket.id })
+            )
+          end
+
+          triaged[#triaged + 1] = enriched
+        end
+
+        local metrics = Datagen.clone(Datagen.get(inputData, "stats", {
+          inputCount = #tickets,
+          highHintCount = 0,
+          missingContentCount = 0
+        }))
+        metrics = Datagen.set(metrics, "inputCount", #tickets)
+
+        return {
+          tickets = triaged,
+          metrics = metrics,
+          highPriorityCount = highPriorityCount
+        }
+    constrain:
+      type: object
+      shape:
+        tickets:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            shape:
+              id:
+                type: string
+              slug:
+                type: string
+              title:
+                type: string
+              body:
+                type: string
+              product:
+                type: string
+              analysis:
+                type: object
+                shape:
+                  summary:
+                    type: string
+                  priority:
+                    type: string
+                  team:
+                    type: string
+                  rationale:
+                    type: string
+        metrics:
+          type: object
+          shape:
+            inputCount:
+              type: number
+            highHintCount:
+              type: number
+            missingContentCount:
+              type: number
+        highPriorityCount:
+          type: number
+
+  - id: compute_run_flags
+    mode: lua
+    dependsOn: [classify_tickets]
+    instructions: Compute branch flags from triage output.
+    lua:
+      source: inline
+      code: |
+        local ctx = ...
+        local triage = ctx.stageInput or {}
+        local total = #Datagen.get(triage, "tickets", {})
+        local high = Datagen.get(triage, "highPriorityCount", 0)
+        local shouldEscalate = high > 0
+        return {
+          totalTickets = total,
+          highPriorityCount = high,
+          shouldEscalate = shouldEscalate
+        }
+  - id: escalation_digest
+    dependsOn: [compute_run_flags, classify_tickets]
+    when:
+      path: outputsByStage.compute_run_flags.shouldEscalate
+      equals: true
+    instructions: >
+      You are an on-call operations lead.
+      Produce a compact escalation digest as one JSON object with:
+      - incidentSummary: short paragraph
+      - immediateActions: array of 3 short actions
+      - managerPing: one-sentence status update
+      Use outputsByStage.classify_tickets context.
+    constrain:
+      type: object
+      shape:
+        incidentSummary:
+          type: string
+        immediateActions:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            type: string
+        managerPing:
+          type: string
+
+  - id: emit_triage_rows
+    mode: lua
+    dependsOn: [classify_tickets]
+    instructions: Convert triage object into an array for iter reply drafting.
+    lua:
+      source: inline
+      code: |
+        local ctx = ...
+        local triage = ctx.stageInput or {}
+        local tickets = Datagen.get(triage, "tickets", {})
+        local rows = {}
+
+        for i = 1, #tickets do
+          local item = tickets[i]
+          rows[#rows + 1] = {
+            id = item.id,
+            product = item.product,
+            title = item.title,
+            body = item.body,
+            priority = Datagen.get(item, "analysis.priority", "medium"),
+            team = Datagen.get(item, "analysis.team", "support"),
+            summary = Datagen.get(item, "analysis.summary", "")
+          }
+        end
+
+        return rows
+    constrain:
+      type: array
+      minItems: 1
+      items:
+        type: object
+        shape:
+          id:
+            type: string
+          product:
+            type: string
+          title:
+            type: string
+          body:
+            type: string
+          priority:
+            type: string
+          team:
+            type: string
+          summary:
+            type: string
+
+  - id: draft_customer_replies
+    mode: iter
+    dependsOn: [emit_triage_rows]
+    parallelism: 4
+    instructions: >
+      Draft a concise customer-safe response for the current item.
+      Return one JSON object with:
+      - id: same id
+      - response: short plain-text reply
+      - escalationRecommended: boolean
+      Base escalationRecommended on priority/team.
+    retry:
+      enabled: true
+      maxAttempts: 2
+    constrain:
+      type: object
+      shape:
+        id:
+          type: string
+        response:
+          type: string
+          minLength: 20
+        escalationRecommended:
+          type: boolean
+
+  - id: build_review_packet
+    mode: lua
+    dependsOn: [classify_tickets, compute_run_flags, draft_customer_replies]
+    instructions: >
+      Build final markdown + JSONL packet combining triage output, flags, reply
+      drafts, and optional escalation digest.
+    lua:
+      source: inline
+      code: |
+        local ctx = ...
+        local triage = Datagen.get(ctx, "outputsByStage.classify_tickets", {})
+        local flags = Datagen.get(ctx, "outputsByStage.compute_run_flags", {})
+        local replies = ctx.stageInput or {}
+        local escalation = Datagen.get(ctx, "outputsByStage.escalation_digest", nil)
+        local tickets = Datagen.get(triage, "tickets", {})
+
+        local markdown = "## Ticket Triage Review\n\n"
+        markdown = markdown .. Datagen.textTemplate(
+          "- Total tickets: {total}\n- High priority: {high}\n\n",
+          {
+            total = Datagen.get(flags, "totalTickets", #tickets),
+            high = Datagen.get(flags, "highPriorityCount", 0)
+          }
+        )
+
+        if escalation ~= nil then
+          markdown = markdown .. "## Escalation Digest\n"
+          markdown = markdown .. Datagen.get(escalation, "incidentSummary", "") .. "\n\n"
+        end
+
+        local jsonl = {}
+        for i = 1, #tickets do
+          local item = tickets[i]
+          local reply = replies[i] or {}
+          local row = {
+            id = item.id,
+            product = item.product,
+            priority = Datagen.get(item, "analysis.priority", "medium"),
+            team = Datagen.get(item, "analysis.team", "support"),
+            summary = Datagen.get(item, "analysis.summary", ""),
+            reply = Datagen.get(reply, "response", "")
+          }
+          jsonl[#jsonl + 1] = Datagen.toJson(row)
+
+          markdown = markdown .. Datagen.textTemplate(
+            "### {id} [{priority}/{team}]\nSummary: {summary}\nReply: {reply}\n\n",
+            {
+              id = row.id,
+              priority = row.priority,
+              team = row.team,
+              summary = row.summary,
+              reply = row.reply
+            }
+          )
+        end
+
+        local metricsJson = Datagen.toJson(Datagen.get(triage, "metrics", {}))
+        local metrics = Datagen.fromJson(metricsJson, {})
+
+        if #tickets == 0 then
+          Datagen.emitWarning("lua.triage.empty", "No tickets available for review packet")
+        end
+
+        return {
+          count = #tickets,
+          markdown = markdown,
+          jsonl = jsonl,
+          metrics = metrics,
+          stage = ctx.stageIdentifier
+        }
+    constrain:
+      type: object
+      shape:
+        count:
+          type: number
+        markdown:
+          type: string
+        jsonl:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        metrics:
+          type: object
+          shape:
+            inputCount:
+              type: number
+            highHintCount:
+              type: number
+            missingContentCount:
+              type: number
+        stage:
+          type: string
+    validate:
+      rules:
+        - path: markdown
+          kind: contains
+          value: "## Ticket Triage Review"

@@ -1,0 +1,42 @@
+[
+  {
+    "id": "T-1001",
+    "title": "Charged twice after upgrading plan",
+    "body": "I switched from Starter to Pro and got billed for both tiers this month. Please reverse the duplicate charge.",
+    "product": "Billing",
+    "priorityHint": "high",
+    "meta": {
+      "raw_json": "{\"severity\":\"high\",\"channel\":\"email\"}"
+    }
+  },
+  {
+    "id": "T-1002",
+    "title": "Search times out on large projects",
+    "body": "Search takes over 30 seconds and often fails when our project has more than 10k files. This blocks support during incidents.",
+    "product": "Platform",
+    "priorityHint": "medium",
+    "meta": {
+      "raw_json": "{\"severity\":\"medium\",\"channel\":\"chat\"}"
+    }
+  },
+  {
+    "id": "T-1003",
+    "title": "Need VAT invoice fields on receipts",
+    "body": "Our finance team needs VAT number and legal entity address shown on all receipts for compliance.",
+    "product": "Billing",
+    "priorityHint": "low",
+    "meta": {
+      "raw_json": "{\"severity\":\"low\",\"channel\":\"portal\"}"
+    }
+  },
+  {
+    "id": "T-1004",
+    "title": "Intermittent login loop on SSO",
+    "body": "Users get redirected back to login several times before entering the dashboard. Happens mostly after idle sessions.",
+    "product": "Auth",
+    "priorityHint": "high",
+    "meta": {
+      "raw_json": "{\"severity\":\"high\",\"channel\":\"email\"}"
+    }
+  }
+]

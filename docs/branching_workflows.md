@@ -7,12 +7,14 @@ This guide explains Datagen branching workflows in practical terms:
 - what conditional execution does
 - what branching supports today (and what it does not)
 
-If you are new to workflows in general, read [Workflow Patterns](./workflow-patterns.md) first.
-Use [Workflow Reference](./workflow-reference.md) for full schema details.
+If you are new to workflows in general, read
+[Workflow Patterns](./workflow-patterns.md) first. Use
+[Workflow Reference](./workflow-reference.md) for full schema details.
 
 ## Why Branching Exists
 
-Linear pipelines are great until one stage needs to feed multiple downstream paths.
+Linear pipelines are great until one stage needs to feed multiple downstream
+paths.
 
 Branching lets you:
 
@@ -59,11 +61,14 @@ Supported operators:
 
 - `equals`
 - `notEquals`
+- `any`
+- `notAny`
 
 Exactly one must be set.
 
-> **Important:** `when` does not invent values.  
-> Your path must point to data that already exists in `initialContext` or a prior stage output.
+> **Important:** `when` does not invent values.\
+> Your path must point to data that already exists in `initialContext` or a
+> prior stage output.
 
 ### Stage Status
 
@@ -91,7 +96,8 @@ Important:
 
 - Stage-level execution is deterministic.
 - Stage-level execution is not currently parallel.
-- Item-level parallelism is available inside `iter`/`record_transform` via `parallelism`.
+- Item-level parallelism is available inside `iter`/`record_transform` via
+  `parallelism`.
 
 ---
 
@@ -127,7 +133,8 @@ If the path is missing, the condition evaluates false.
 
 ### Where condition fields come from (critical)
 
-Condition fields like `outputsByStage.seed.shouldRunAudit` come from an upstream stage output.
+Condition fields like `outputsByStage.seed.shouldRunAudit` come from an upstream
+stage output.
 
 That means your upstream stage must produce that field explicitly.
 
@@ -170,18 +177,20 @@ Why this matters:
 
 ## What downstream stages can see
 
-Stages receive prior stage outputs as context.
-In branching workflows, this allows merge stages to reference multiple upstream outputs.
+Stages receive prior stage outputs as context. In branching workflows, this
+allows merge stages to reference multiple upstream outputs.
 
 ## Important mode-specific detail
 
 For `iter` and `record_transform` stages using `previous_stage` semantics:
 
-- when a stage has multiple dependencies, Datagen currently uses the **last dependency key** as the direct array source for that mode.
+- when a stage has multiple dependencies, Datagen currently uses the **last
+  dependency key** as the direct array source for that mode.
 
 Practical implication:
 
-- for fan-in with `iter`/`record_transform`, create an explicit merge/prepare batch stage first, then iterate/transform from that merged output.
+- for fan-in with `iter`/`record_transform`, create an explicit merge/prepare
+  batch stage first, then iterate/transform from that merged output.
 
 ---
 
@@ -321,7 +330,41 @@ Notes:
 - child workflow config is respected by default (`inheritParentCli: none`)
 - `onFailure: warn` emits `delegated_workflow_failed` and returns `null` output
 - delegation supports nesting up to depth `3` and blocks cycles
-- delegated child runs currently use eager execution path (no child streaming/resume in v1)
+- delegated child runs currently use eager execution path (no child
+  streaming/resume in v1)
+
+## 5) Compute Branch Conditions with Lua
+
+```yaml
+stages:
+  - id: seed
+    instructions: Return one JSON object with records.
+
+  - id: compute_flags
+    mode: lua
+    dependsOn: [seed]
+    instructions: Compute deterministic routing flags.
+    lua:
+      source: inline
+      code: |
+        local ctx = ...
+        local records = (ctx.stageInput and ctx.stageInput.records) or {}
+        return {
+          shouldRunAudit = #records >= 100
+        }
+
+  - id: audit
+    dependsOn: [compute_flags]
+    when:
+      path: outputsByStage.compute_flags.shouldRunAudit
+      equals: true
+    instructions: Run expensive audit branch.
+```
+
+When to use:
+
+- branch gating is deterministic and policy-driven
+- you want route logic versioned in workflow code, not prompt prose
 
 ---
 
@@ -339,7 +382,8 @@ Notes:
 - Arbitrary boolean expressions in `when` (`and`/`or` trees, ranges, regex)
 - Explicit `else` branches
 - Stage-level parallel DAG execution
-- Automatic join semantics for multi-dependency array inputs in `iter`/`record_transform`
+- Automatic join semantics for multi-dependency array inputs in
+  `iter`/`record_transform`
 - Cross-stage rollback/transactions
 
 ---

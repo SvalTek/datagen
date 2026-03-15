@@ -335,6 +335,135 @@ Deno.test("StageSchema accepts workflow_delegate config and enforces delegate co
   );
 });
 
+Deno.test("StageSchema accepts lua config and enforces lua constraints", () => {
+  const inlineLua = StageSchema.parse({
+    id: "lua_inline",
+    instructions: "Compute output",
+    mode: "lua",
+    lua: {
+      source: "inline",
+      code: "local ctx = ...; return { ok = true, input = ctx.stageInput }",
+      runtime: {
+        functionTimeoutMs: 750,
+        openStandardLibs: false,
+      },
+    },
+  });
+  assertEquals(inlineLua.mode, "lua");
+  assertEquals(inlineLua.lua?.source, "inline");
+  assertEquals(inlineLua.lua?.runtime?.functionTimeoutMs, 750);
+
+  const fileLua = StageSchema.parse({
+    id: "lua_file",
+    instructions: "Compute output",
+    mode: "lua",
+    lua: {
+      source: "file",
+      filePath: "./scripts/compute.lua",
+    },
+  });
+  assertEquals(fileLua.lua?.source, "file");
+  assertEquals(fileLua.lua?.filePath, "./scripts/compute.lua");
+
+  assertThrows(
+    () =>
+      StageSchema.parse({
+        id: "lua_missing_block",
+        instructions: "Missing block",
+        mode: "lua",
+      }),
+    Error,
+    "lua stages require a lua block",
+  );
+
+  assertThrows(
+    () =>
+      StageSchema.parse({
+        id: "lua_wrong_mode",
+        instructions: "Wrong mode",
+        mode: "batch",
+        lua: {
+          source: "inline",
+          code: "return {}",
+        },
+      }),
+    Error,
+    "lua is only supported",
+  );
+
+  assertThrows(
+    () =>
+      StageSchema.parse({
+        id: "lua_inline_bad",
+        instructions: "Invalid inline",
+        mode: "lua",
+        lua: {
+          source: "inline",
+          filePath: "./bad.lua",
+        },
+      }),
+    Error,
+    "lua.code is required",
+  );
+
+  assertThrows(
+    () =>
+      StageSchema.parse({
+        id: "lua_file_bad",
+        instructions: "Invalid file",
+        mode: "lua",
+        lua: {
+          source: "file",
+          code: "return {}",
+        },
+      }),
+    Error,
+    "lua.filePath is required",
+  );
+
+  assertThrows(
+    () =>
+      StageSchema.parse({
+        id: "lua_runtime_bad",
+        instructions: "Invalid runtime",
+        mode: "lua",
+        lua: {
+          source: "inline",
+          code: "return {}",
+          runtime: {
+            functionTimeoutMs: -1,
+          },
+        },
+      }),
+    Error,
+  );
+});
+
+Deno.test("PipelineDocumentSchema accepts workflow-level luaRuntime defaults", () => {
+  const parsed = PipelineDocumentSchema.parse({
+    model: "mock-model",
+    luaRuntime: {
+      functionTimeoutMs: 1500,
+      openStandardLibs: true,
+      injectObjects: true,
+      enableProxy: true,
+      traceAllocations: false,
+    },
+    stages: [{
+      id: "lua_stage",
+      mode: "lua",
+      instructions: "Run lua",
+      lua: {
+        source: "inline",
+        code: "return { ok = true }",
+      },
+    }],
+  });
+
+  assertEquals(parsed.luaRuntime?.functionTimeoutMs, 1500);
+  assertEquals(parsed.luaRuntime?.openStandardLibs, true);
+});
+
 Deno.test("PipelineDocumentSchema validates dependency keys and input readMode", () => {
   const out = PipelineDocumentSchema.parse({
     input: {
@@ -362,6 +491,42 @@ Deno.test("PipelineDocumentSchema validates dependency keys and input readMode",
     Error,
     "Unknown stage dependency",
   );
+
+  assertThrows(
+    () =>
+      PipelineDocumentSchema.parse({
+        stages: [{
+          id: "lua_stage",
+          mode: "lua",
+          instructions: "Run lua",
+          input: { source: "pipeline_input" },
+          lua: {
+            source: "inline",
+            code: "return {}",
+          },
+        }],
+      }),
+    Error,
+    "lua stages using pipeline_input require pipeline.input to be configured",
+  );
+
+  assertThrows(
+    () =>
+      PipelineDocumentSchema.parse({
+        stages: [{
+          id: "lua_stage",
+          mode: "lua",
+          instructions: "Run lua",
+          input: { source: "previous_stage" },
+          lua: {
+            source: "inline",
+            code: "return {}",
+          },
+        }],
+      }),
+    Error,
+    "first lua stage cannot use previous_stage without a dependency",
+  );
 });
 
 Deno.test("parsePipelineYaml parses and validates valid YAML", () => {
@@ -377,7 +542,7 @@ httpReferer: https://example.com/datagen
 xTitle: Datagen
 maxTokens: 2048
 temperature: 1.25
-outputDir: ./output
+outputDir: ./tests/outputs
 stages:
   - name: seed
     instructions: generate seed records
@@ -404,7 +569,7 @@ stages:
   assertEquals(pipeline.xTitle, "Datagen");
   assertEquals(pipeline.maxTokens, 2048);
   assertEquals(pipeline.temperature, 1.25);
-  assertEquals(pipeline.outputDir, "./output");
+  assertEquals(pipeline.outputDir, "./tests/outputs");
   assertEquals(pipeline.stages[1].reasoning, true);
   assertEquals(pipeline.stages.length, 2);
   assertEquals(pipeline.stages[1].constrain?.type, "object");
@@ -438,6 +603,62 @@ Deno.test("PipelineDocumentSchema rejects invalid reasoningMode values", () => {
     () =>
       PipelineDocumentSchema.parse({
         reasoningMode: "auto",
+        stages: [{ instructions: "seed" }],
+      }),
+    Error,
+  );
+});
+
+Deno.test("PipelineDocumentSchema accepts supported structuredOutputMode values and omits by default", () => {
+  const object = PipelineDocumentSchema.parse({
+    structuredOutputMode: "object",
+    stages: [{ instructions: "seed" }],
+  });
+  const json = PipelineDocumentSchema.parse({
+    structuredOutputMode: "json",
+    stages: [{ instructions: "seed" }],
+  });
+  const jsonArray = PipelineDocumentSchema.parse({
+    structuredOutputMode: "json-array",
+    stages: [{ instructions: "seed" }],
+  });
+  const off = PipelineDocumentSchema.parse({
+    structuredOutputMode: "off",
+    stages: [{ instructions: "seed" }],
+  });
+  const omitted = PipelineDocumentSchema.parse({
+    stages: [{ instructions: "seed" }],
+  });
+
+  assertEquals(object.structuredOutputMode, "object");
+  assertEquals(json.structuredOutputMode, "json");
+  assertEquals(jsonArray.structuredOutputMode, "json-array");
+  assertEquals(off.structuredOutputMode, "off");
+  assertEquals(omitted.structuredOutputMode, undefined);
+});
+
+Deno.test("PipelineDocumentSchema rejects invalid structuredOutputMode values", () => {
+  assertThrows(
+    () =>
+      PipelineDocumentSchema.parse({
+        structuredOutputMode: "auto",
+        stages: [{ instructions: "seed" }],
+      }),
+    Error,
+  );
+});
+
+Deno.test("PipelineDocumentSchema accepts repeat and rejects invalid values", () => {
+  const repeated = PipelineDocumentSchema.parse({
+    repeat: 3,
+    stages: [{ instructions: "seed" }],
+  });
+  assertEquals(repeated.repeat, 3);
+
+  assertThrows(
+    () =>
+      PipelineDocumentSchema.parse({
+        repeat: 0,
         stages: [{ instructions: "seed" }],
       }),
     Error,
@@ -686,10 +907,13 @@ Deno.test({
   permissions: { read: true },
   async fn() {
     const samplePaths = [
-      "./example.pipeline.yaml",
-      "./rp.pipeline.yaml",
-      "./sharegpt-rewrite.pipeline.yaml",
-      "./llm-arena-rewrite.pipeline.yaml",
+      "./examples/example.pipeline.yaml",
+      "./examples/rp.pipeline.yaml",
+      "./examples/sharegpt-rewrite.pipeline.yaml",
+      "./examples/05_lua_stage_flags.pipeline.yaml",
+      "./examples/06_lua_file_transform.pipeline.yaml",
+      "./examples/08_story_object_bridge.pipeline.yaml",
+      "./tests/workflows/delegate-sample.pipeline.yaml",
     ];
 
     for (const samplePath of samplePaths) {

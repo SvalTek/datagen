@@ -1,0 +1,20 @@
+name: delegate-sample
+model: test-model
+endpoint: http://localhost:11434/
+outputDir: ./tests/outputs
+stages:
+  - id: seed
+    instructions: Return candidate payload as JSON.
+
+  - id: delegated_judge
+    mode: workflow_delegate
+    dependsOn:
+      - seed
+    instructions: Delegate scoring to child workflow.
+    delegate:
+      workflowPath: ./child-judge.pipeline.yaml
+      inputFromPath: outputsByStage.seed
+      inputAs: initial_context
+      outputFrom: final_stage_output
+      onFailure: warn
+      inheritParentCli: none

@@ -1,0 +1,245 @@
+version: 1
+name: 08-story-object-bridge
+description: >
+  Demonstrates prose -> constrained object -> Lua selection -> synthetic user
+  bridge -> assistant continuation -> final conversation collapse.
+
+model: qwen2.5:14b
+provider: ollama
+endpoint: http://localhost:11434/
+#provider: openai
+#endpoint:  http://192.168.0.100:5001/
+#apiKeyEnv: KOBOLDCPP_API_KEY
+
+structuredOutputMode: object
+repeat: 10
+outputDir: ./examples/outputs
+
+luaRuntime:
+  functionTimeoutMs: 2000
+  openStandardLibs: true
+  injectObjects: true
+  enableProxy: true
+  traceAllocations: false
+
+stages:
+  - id: scene_text
+    mode: batch
+    instructions: >
+      Write one interactive fantasy scene-opening as JSON.
+      Return a JSON object with:
+      - sceneText: a short assistant-style scene opener in second person
+      Requirements:
+      - vivid but concise
+      - imply 3 plausible next actions without formally listing them
+      - no markdown
+    constrain:
+      type: object
+      shape:
+        sceneText:
+          type: string
+          minLength: 80
+
+  - id: scene_structure
+    mode: batch
+    dependsOn: [scene_text]
+    instructions: >
+      Convert outputsByStage.scene_text.sceneText into a structured interaction
+      object.
+
+      Return a JSON object with:
+      - narration: the assistant-facing scene narration
+      - actions: array of exactly 3 short user-selectable actions
+      - tone: short style label
+      - location: short place label
+
+      Requirements:
+      - keep actions distinct
+      - actions must be directly grounded in the scene text
+      - no markdown
+    constrain:
+      type: object
+      shape:
+        narration:
+          type: string
+          minLength: 50
+        actions:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            type: string
+            minLength: 4
+        tone:
+          type: string
+        location:
+          type: string
+
+  - id: choose_action_bridge
+    mode: lua
+    dependsOn: [scene_structure]
+    instructions: >
+      Deterministically consume the structured object, pick one action, and
+      synthesize an in-character bridge user turn.
+    lua:
+      source: inline
+      code: |
+        local ctx = ...
+        local data = ctx.stageInput or {}
+        local actions = Datagen.get(data, "actions", {})
+        Datagen.assert(#actions > 0, "scene_structure.actions must contain at least one action")
+
+        local chosenIndex = math.random(#actions)
+        local chosenAction = actions[chosenIndex]
+
+        local prompt = Datagen.prompt({
+          "Your task is to write a single reply for User",
+          "The reply should look like what a real player would type in a text adventure or CYOA UI.",
+          "Output only the user's reply.",
+          "Do not write narration. Do not continue the story.",
+          "Do not describe what happens next.",
+          "Do not write prose. Keep it short. Prefer 1 to 6 words.",
+          "Fragments are better than full sentences.",
+          "Users are often lazy. Exact or shortened option text is good.",
+          Datagen.textTemplate("Chosen action: {choice}", {
+            choice = chosenAction
+          })
+        })
+
+        local syntheticUserTurn = LLM.generate(prompt, {
+          max_tokens = 40,
+          temperature = 0.5,
+          reasoning_mode = "think",
+          think = false
+        })
+
+        return {
+          narration = Datagen.get(data, "narration", ""),
+          actions = actions,
+          tone = Datagen.get(data, "tone", ""),
+          location = Datagen.get(data, "location", ""),
+          chosenAction = chosenAction,
+          chosenIndex = chosenIndex,
+          syntheticUserTurn = Datagen.trim(syntheticUserTurn)
+        }
+    retry:
+      enabled: true
+      maxAttempts: 2
+    constrain:
+      type: object
+      shape:
+        narration:
+          type: string
+        actions:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            type: string
+        tone:
+          type: string
+        location:
+          type: string
+        chosenAction:
+          type: string
+        chosenIndex:
+          type: number
+          min: 1
+          max: 3
+        syntheticUserTurn:
+          type: string
+          minLength: 4
+          maxLength: 64
+
+  - id: assistant_continuation
+    mode: batch
+    dependsOn: [choose_action_bridge]
+    instructions: >
+      Continue the story from the selected action and synthetic user turn.
+
+      Return a JSON object with:
+      - assistantTurn: the next assistant response continuing the scene
+
+      Requirements:
+      - directly acknowledge the chosen action
+      - remain consistent with narration, tone, and location
+      - no markdown
+    constrain:
+      type: object
+      shape:
+        assistantTurn:
+          type: string
+          minLength: 60
+
+  - id: collapse_conversation
+    mode: lua
+    dependsOn: [scene_structure, choose_action_bridge, assistant_continuation]
+    instructions: >
+      Collapse intermediate generation mechanics into a clean final training
+      record while preserving bridge metadata.
+    lua:
+      source: inline
+      code: |
+        local ctx = ...
+        local structured = Datagen.get(ctx, "outputsByStage.scene_structure", {})
+        local bridge = Datagen.get(ctx, "outputsByStage.choose_action_bridge", {})
+        local continuation = Datagen.get(ctx, "outputsByStage.assistant_continuation", {})
+
+        local actions = Datagen.get(structured, "actions", {})
+        local assistantOffer = Datagen.prompt({
+          Datagen.get(structured, "narration", ""),
+          "Options:",
+          Datagen.bullets(actions)
+        })
+
+        return {
+          conversations = {
+            {
+              from = "assistant",
+              value = assistantOffer
+            },
+            {
+              from = "user",
+              value = Datagen.get(bridge, "chosenAction", "")
+            },
+            {
+              from = "assistant",
+              value = Datagen.get(continuation, "assistantTurn", "")
+            }
+          },
+          generationMeta = {
+            syntheticUserTurn = Datagen.get(bridge, "syntheticUserTurn", ""),
+            chosenAction = Datagen.get(bridge, "chosenAction", ""),
+            chosenIndex = Datagen.get(bridge, "chosenIndex", 0),
+            tone = Datagen.get(bridge, "tone", ""),
+            location = Datagen.get(bridge, "location", "")
+          }
+        }
+    constrain:
+      type: object
+      shape:
+        conversations:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            type: object
+            shape:
+              from:
+                type: string
+              value:
+                type: string
+                minLength: 1
+        generationMeta:
+          type: object
+          shape:
+            syntheticUserTurn:
+              type: string
+            chosenAction:
+              type: string
+            chosenIndex:
+              type: number
+            tone:
+              type: string
+            location:
+              type: string

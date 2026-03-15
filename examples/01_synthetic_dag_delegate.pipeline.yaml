@@ -1,0 +1,170 @@
+version: 1
+name: 01-synthetic-dag-delegate
+description: >
+  Demonstrates DAG + conditional branching + iter + delegated child workflow.
+  This is a "feature tour" example, not a domain-specific production pipeline.
+
+# Default runtime for local Ollama
+model: qwen2.5-coder:14b
+provider: ollama
+endpoint: http://localhost:11434/
+reasoningMode: off
+
+# Optional provider metadata for hosted OpenAI-compatible providers.
+# Keep commented for local Ollama use.
+# apiKeyEnv: OPENROUTER_API_KEY
+# httpReferer: https://github.com/SvalTek/datagen
+# xTitle: Datagen Examples
+
+maxTokens: 2048
+temperature: 0.7
+outputDir: ./examples/outputs
+
+stages:
+  # 1) Seed stage creates base records + control flags used by `when`.
+  - id: seed
+    description: Create candidate records and an optional review flag.
+    instructions: >
+      Return JSON object:
+      {
+        "runDeepReview": boolean,
+        "records": [
+          {"id": "item-1", "raw": "..." }
+        ]
+      }
+    system: You are a structured dataset generator.
+    rules:
+      include:
+        - Keep IDs stable and deterministic.
+      exclude:
+        - Markdown/code fences.
+    examples:
+      - input: "seed request"
+        output: "{\"runDeepReview\":true,\"records\":[{\"id\":\"item-1\",\"raw\":\"Example\"}]}"
+    constrain:
+      type: object
+      shape:
+        runDeepReview:
+          type: boolean
+        records:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            shape:
+              id:
+                type: string
+                pattern: "^item-[0-9]+$"
+              raw:
+                type: string
+                minLength: 3
+    validate:
+      onFailure: fail
+      rules:
+        - name: records_min
+          path: records
+          kind: array_min_length
+          value: 1
+    metadata:
+      purpose: feature-tour-seed
+
+  # 2) Normalize each record independently (iter mode).
+  - id: normalize_item
+    mode: iter
+    dependsOn:
+      - seed
+    parallelism: 4
+    instructions: >
+      Input is one record from seed.records.
+      Return one normalized object:
+      {
+        "id": "...",
+        "normalized": "...",
+        "quality": number
+      }
+    history: Preserve meaning while cleaning noisy formatting.
+    retry:
+      enabled: true
+      maxAttempts: 2
+    constrain:
+      type: object
+      shape:
+        id:
+          type: string
+        normalized:
+          type: string
+          minLength: 3
+        quality:
+          type: number
+          min: 0
+          max: 1
+    validate:
+      onFailure: fail
+      rules:
+        - path: normalized
+          kind: min_length
+          value: 3
+
+  # 3) Optional delegated review branch, controlled by `seed.runDeepReview`.
+  - id: delegated_review
+    mode: workflow_delegate
+    dependsOn:
+      - normalize_item
+      - seed
+    when:
+      path: outputsByStage.seed.runDeepReview
+      equals: true
+    instructions: Delegate deep review to child workflow.
+    delegate:
+      # Child path is resolved relative to this parent workflow file.
+      workflowPath: ./01_child_judge.pipeline.yaml
+      # This reads from parent context object:
+      # { initialContext, outputsByStage }
+      inputFromPath: outputsByStage.normalize_item
+      # Child receives this value as child initialContext.
+      inputAs: initial_context
+      outputFrom: final_stage_output
+      # Pull only the field we want from child output.
+      outputSelectPath: review
+      # If child fails, continue with null output + warning.
+      onFailure: warn
+      # Respect child workflow runtime config by default.
+      inheritParentCli: none
+
+  # 4) Final stage consumes either delegated review output or null.
+  - id: finalize
+    dependsOn:
+      - normalize_item
+      - delegated_review
+    instructions: >
+      Build final export object:
+      {
+        "records": [...normalized records...],
+        "review": delegated review object OR null,
+        "exportedAt": "iso timestamp string"
+      }
+    constrain:
+      type: object
+      shape:
+        records:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            shape:
+              id:
+                type: string
+              normalized:
+                type: string
+              quality:
+                type: number
+        review:
+          type: object
+          nullable: true
+          shape:
+            recommendation:
+              type: string
+            confidence:
+              type: number
+        exportedAt:
+          type: string

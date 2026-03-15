@@ -126,7 +126,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts applies pipeline-level completion settings when CLI does not override them",
+  name:
+    "main.ts applies pipeline-level completion settings when CLI does not override them",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     let lastPayload: Record<string, unknown> | undefined;
@@ -144,7 +145,9 @@ Deno.test({
     });
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-pipeline-completion-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-pipeline-completion-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -195,7 +198,354 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts keeps reasoningMode config compatible without transport-specific payload shaping",
+  name: "main.ts repeats non-streaming workflows and appends each final output to JSONL",
+  permissions: { read: true, write: true, net: true, run: true, env: true },
+  async fn() {
+    let callCount = 0;
+    const server = startLocalServer(async (_req) => {
+      callCount++;
+      return Response.json({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({ run: callCount }),
+            },
+          },
+        ],
+      });
+    });
+
+    const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-repeat-run-",
+    });
+
+    try {
+      await Deno.writeTextFile(
+        pipelinePath,
+        `
+name: repeat-run
+model: yaml-model
+endpoint: ${server.baseUrl}
+repeat: 3
+outputDir: ${outputDir.replace(/\\/g, "/")}
+stages:
+  - name: seed
+    instructions: Generate one record
+`,
+      );
+
+      const command = new Deno.Command(Deno.execPath(), {
+        args: [
+          "run",
+          "--allow-read",
+          "--allow-write",
+          "--allow-net",
+          "--allow-env",
+          "main.ts",
+          "--console",
+          "full",
+          pipelinePath,
+        ],
+        stdout: "piped",
+        stderr: "piped",
+      });
+
+      const output = await command.output();
+      const stdout = new TextDecoder().decode(output.stdout).trim();
+      const report = JSON.parse(stdout);
+      const jsonlText = await Deno.readTextFile(`${outputDir}/repeat-run.jsonl`);
+
+      assertEquals(output.code, 0);
+      assertEquals(report.ok, true);
+      assertEquals(report.repeatCount, 3);
+      assertEquals(report.completedRepeats, 3);
+      assertEquals(report.result.outputsByStage.seed, [
+        { run: 1 },
+        { run: 2 },
+        { run: 3 },
+      ]);
+      assertEquals(report.result.stageMeta.seed.sampleCount, 3);
+      assertEquals(report.result.stageMeta.seed.successCount, 3);
+      assertEquals(report.result.stageMeta.seed.failureCount, 0);
+      assertEquals(report.result.stageMeta.seed.warningCount, 0);
+      assertEquals(report.result.stageMeta.seed.successRatePct, 100);
+      assertEquals(report.result.stageMeta.seed.failureRatePct, 0);
+      assertEquals(report.result.stageMeta.seed.warningRatePct, 0);
+      assertEquals(jsonlText.trim().split("\n"), [
+        JSON.stringify({ run: 1 }),
+        JSON.stringify({ run: 2 }),
+        JSON.stringify({ run: 3 }),
+      ]);
+    } finally {
+      await server.close();
+      await Deno.remove(pipelinePath).catch(() => {});
+      await Deno.remove(outputDir, { recursive: true }).catch(() => {});
+    }
+  },
+});
+
+Deno.test({
+  name: "main.ts repeats lua workflows with fresh LLM chat history each iteration",
+  permissions: { read: true, write: true, net: true, run: true, env: true },
+  async fn() {
+    const seenMessageCounts: number[] = [];
+    let callCount = 0;
+    const server = startLocalServer(async (req) => {
+      callCount++;
+      const payload = await req.json();
+      const messages = Array.isArray(payload.messages) ? payload.messages : [];
+      seenMessageCounts.push(messages.length);
+      return Response.json({
+        choices: [
+          {
+            message: {
+              content: `repeat-${callCount}`,
+            },
+          },
+        ],
+      });
+    });
+
+    const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-repeat-lua-history-",
+    });
+
+    try {
+      await Deno.writeTextFile(
+        pipelinePath,
+        `
+name: repeat-lua-history-run
+model: yaml-model
+endpoint: ${server.baseUrl}
+repeat: 2
+outputDir: ${outputDir.replace(/\\/g, "/")}
+stages:
+  - id: lua_stage
+    mode: lua
+    instructions: Run lua
+    lua:
+      source: inline
+      code: |
+        local value = LLM.generate("Emit one short token")
+        return { value = value }
+`,
+      );
+
+      const command = new Deno.Command(Deno.execPath(), {
+        args: [
+          "run",
+          "--allow-read",
+          "--allow-write",
+          "--allow-net",
+          "--allow-env",
+          "main.ts",
+          "--console",
+          "full",
+          pipelinePath,
+        ],
+        stdout: "piped",
+        stderr: "piped",
+      });
+
+      const output = await command.output();
+      const report = JSON.parse(new TextDecoder().decode(output.stdout).trim());
+
+      assertEquals(output.code, 0);
+      assertEquals(report.ok, true);
+      assertEquals(seenMessageCounts, [1, 1]);
+      assertEquals(report.result.outputsByStage.lua_stage, [
+        { value: "repeat-1" },
+        { value: "repeat-2" },
+      ]);
+    } finally {
+      await server.close();
+      await Deno.remove(pipelinePath).catch(() => {});
+      await Deno.remove(outputDir, { recursive: true }).catch(() => {});
+    }
+  },
+});
+
+Deno.test({
+  name: "main.ts repeats workflows with array final outputs and preserves flat JSONL shape",
+  permissions: { read: true, write: true, net: true, run: true, env: true },
+  async fn() {
+    let seedCallCount = 0;
+    const server = startLocalServer(async (req) => {
+      const payload = await req.json();
+      const messages = payload.messages ?? [];
+      const userMessage = messages[messages.length - 1];
+      const prompt = userMessage?.content ?? "";
+
+      if (prompt.includes("Emit array")) {
+        seedCallCount++;
+        return Response.json({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify([{ id: seedCallCount }]),
+              },
+            },
+          ],
+        });
+      }
+
+      const match = /"id":\s*(\d+)/.exec(prompt);
+      const id = Number(match?.[1] ?? "0");
+      return Response.json({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({ id, normalized: true }),
+            },
+          },
+        ],
+      });
+    });
+
+    const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-repeat-array-",
+    });
+
+    try {
+      await Deno.writeTextFile(
+        pipelinePath,
+        `
+name: repeat-array-run
+model: yaml-model
+endpoint: ${server.baseUrl}
+repeat: 2
+outputDir: ${outputDir.replace(/\\/g, "/")}
+stages:
+  - name: seed
+    instructions: Emit array
+  - name: normalize
+    mode: iter
+    instructions: Normalize one record
+`,
+      );
+
+      const command = new Deno.Command(Deno.execPath(), {
+        args: [
+          "run",
+          "--allow-read",
+          "--allow-write",
+          "--allow-net",
+          "--allow-env",
+          "main.ts",
+          "--console",
+          "full",
+          pipelinePath,
+        ],
+        stdout: "piped",
+        stderr: "piped",
+      });
+
+      const output = await command.output();
+      const report = JSON.parse(new TextDecoder().decode(output.stdout).trim());
+      const jsonlText = await Deno.readTextFile(`${outputDir}/repeat-array-run.jsonl`);
+
+      assertEquals(output.code, 0);
+      assertEquals(report.ok, true);
+      assertEquals(report.result.outputsByStage.normalize, [
+        [{ id: 1, normalized: true }],
+        [{ id: 2, normalized: true }],
+      ]);
+      assertEquals(jsonlText.trim().split("\n"), [
+        JSON.stringify({ id: 1, normalized: true }),
+        JSON.stringify({ id: 2, normalized: true }),
+      ]);
+    } finally {
+      await server.close();
+      await Deno.remove(pipelinePath).catch(() => {});
+      await Deno.remove(outputDir, { recursive: true }).catch(() => {});
+    }
+  },
+});
+
+Deno.test({
+  name: "main.ts includes per-stage warning and success percentages in stageMeta",
+  permissions: { read: true, write: true, net: true, run: true, env: true },
+  async fn() {
+    const server = startLocalServer(async (_req) =>
+      Response.json({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({ content: "hello" }),
+            },
+          },
+        ],
+      })
+    );
+
+    const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-stage-meta-",
+    });
+
+    try {
+      await Deno.writeTextFile(
+        pipelinePath,
+        `
+name: stage-meta-run
+model: yaml-model
+endpoint: ${server.baseUrl}
+repeat: 2
+outputDir: ${outputDir.replace(/\\/g, "/")}
+stages:
+  - name: validate
+    instructions: Emit object
+    validate:
+      onFailure: warn
+      rules:
+        - path: content
+          kind: contains
+          value: "<reasoning>"
+`,
+      );
+
+      const command = new Deno.Command(Deno.execPath(), {
+        args: [
+          "run",
+          "--allow-read",
+          "--allow-write",
+          "--allow-net",
+          "--allow-env",
+          "main.ts",
+          "--console",
+          "full",
+          pipelinePath,
+        ],
+        stdout: "piped",
+        stderr: "piped",
+      });
+
+      const output = await command.output();
+      const report = JSON.parse(new TextDecoder().decode(output.stdout).trim());
+
+      assertEquals(output.code, 0);
+      assertEquals(report.ok, true);
+      assertEquals(report.result.stageMeta.validate.sampleCount, 2);
+      assertEquals(report.result.stageMeta.validate.successCount, 2);
+      assertEquals(report.result.stageMeta.validate.failureCount, 0);
+      assertEquals(report.result.stageMeta.validate.warningCount, 2);
+      assertEquals(report.result.stageMeta.validate.successRatePct, 100);
+      assertEquals(report.result.stageMeta.validate.failureRatePct, 0);
+      assertEquals(report.result.stageMeta.validate.warningRatePct, 100);
+    } finally {
+      await server.close();
+      await Deno.remove(pipelinePath).catch(() => {});
+      await Deno.remove(outputDir, { recursive: true }).catch(() => {});
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "main.ts keeps reasoningMode config compatible without transport-specific payload shaping",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     const seenPayloads: Array<Record<string, unknown>> = [];
@@ -212,7 +562,9 @@ Deno.test({
       });
     });
 
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-reasoning-mode-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-reasoning-mode-",
+    });
     const pipelinePaths = await Promise.all([
       Deno.makeTempFile({ suffix: ".pipeline.yaml" }),
       Deno.makeTempFile({ suffix: ".pipeline.yaml" }),
@@ -316,7 +668,91 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts resolves provider precedence as CLI > pipeline > DATAGEN_PROVIDER > default",
+  name:
+    "main.ts applies pipeline-level structuredOutputMode for constrained stages",
+  permissions: { read: true, write: true, net: true, run: true, env: true },
+  async fn() {
+    let lastPayload: Record<string, unknown> | undefined;
+    const server = startLocalServer(async (req) => {
+      lastPayload = await req.json();
+      return Response.json({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({ count: 7, label: "json-mode" }),
+            },
+            finish_reason: "stop",
+          },
+        ],
+      });
+    });
+
+    const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-structured-mode-",
+    });
+
+    try {
+      await Deno.writeTextFile(
+        pipelinePath,
+        `
+name: structured-mode-run
+model: yaml-model
+provider: openai
+endpoint: ${server.baseUrl}
+structuredOutputMode: json
+outputDir: ${outputDir.replace(/\\/g, "/")}
+stages:
+  - name: typed
+    instructions: Emit typed object
+    constrain:
+      type: object
+      shape:
+        count:
+          type: number
+        label:
+          type: string
+`,
+      );
+
+      const command = new Deno.Command(Deno.execPath(), {
+        args: [
+          "run",
+          "--allow-read",
+          "--allow-write",
+          "--allow-net",
+          "--allow-env",
+          "main.ts",
+          "--console",
+          "full",
+          pipelinePath,
+        ],
+        stdout: "piped",
+        stderr: "piped",
+      });
+
+      const output = await command.output();
+      const stdout = new TextDecoder().decode(output.stdout).trim();
+      const report = JSON.parse(stdout);
+
+      assertEquals(output.code, 0);
+      assertEquals(report.ok, true);
+      assertEquals(report.result.outputsByStage.typed, {
+        count: 7,
+        label: "json-mode",
+      });
+      assertEquals(lastPayload?.response_format, { type: "json_object" });
+    } finally {
+      await server.close();
+      await Deno.remove(pipelinePath).catch(() => {});
+      await Deno.remove(outputDir, { recursive: true }).catch(() => {});
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "main.ts resolves provider precedence as CLI > pipeline > DATAGEN_PROVIDER > default",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     const server = startLocalServer(async () =>
@@ -325,7 +761,9 @@ Deno.test({
       })
     );
 
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-provider-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-provider-",
+    });
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
 
     try {
@@ -379,7 +817,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts resolves api key from pipeline apiKeyEnv and sends bearer auth header",
+  name:
+    "main.ts resolves api key from pipeline apiKeyEnv and sends bearer auth header",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     let authHeader = "";
@@ -401,7 +840,9 @@ Deno.test({
     });
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-auth-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-auth-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -461,7 +902,9 @@ Deno.test({
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-missing-auth-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-missing-auth-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -536,7 +979,9 @@ Deno.test({
     });
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-headers-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-headers-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -604,7 +1049,16 @@ stages:
       );
 
       const command = new Deno.Command(Deno.execPath(), {
-        args: ["run", "--allow-read", "--allow-write", "--allow-env", "main.ts", "--console", "full", pipelinePath],
+        args: [
+          "run",
+          "--allow-read",
+          "--allow-write",
+          "--allow-env",
+          "main.ts",
+          "--console",
+          "full",
+          pipelinePath,
+        ],
         stdout: "piped",
         stderr: "piped",
       });
@@ -642,7 +1096,9 @@ Deno.test({
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
     const inputPath = await Deno.makeTempFile({ suffix: ".jsonl" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-transform-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-transform-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -708,15 +1164,22 @@ stages:
       const output = await command.output();
       const stdout = new TextDecoder().decode(output.stdout).trim();
       const report = JSON.parse(stdout);
-      const outputText = await Deno.readTextFile(`${outputDir}/transform-run.jsonl`);
-      const outputLines = outputText.trim().split(/\r?\n/).map((line) => JSON.parse(line));
+      const outputText = await Deno.readTextFile(
+        `${outputDir}/transform-run.jsonl`,
+      );
+      const outputLines = outputText.trim().split(/\r?\n/).map((line) =>
+        JSON.parse(line)
+      );
 
       assertEquals(output.code, 0);
       assertEquals(report.ok, true);
       assertEquals(report.inputFormat, "jsonl");
       assertEquals(report.inputRecordCount, 2);
       assertEquals(report.result.warnings.length, 1);
-      assertEquals(outputLines[0].conversations[1].value, "<reasoning>One</reasoning>\nHello");
+      assertEquals(
+        outputLines[0].conversations[1].value,
+        "<reasoning>One</reasoning>\nHello",
+      );
       assertEquals(outputLines[1].conversations[1].value, "Original");
     } finally {
       await server.close();
@@ -728,7 +1191,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts record_transform fails instead of warning-spamming on authorization errors",
+  name:
+    "main.ts record_transform fails instead of warning-spamming on authorization errors",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     const server = startLocalServer(async () =>
@@ -737,7 +1201,9 @@ Deno.test({
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
     const inputPath = await Deno.makeTempFile({ suffix: ".jsonl" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-authfail-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-authfail-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -821,7 +1287,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts reports validator warnings for record_transform turn validation failures",
+  name:
+    "main.ts reports validator warnings for record_transform turn validation failures",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     const server = startLocalServer(async () =>
@@ -838,7 +1305,9 @@ Deno.test({
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
     const inputPath = await Deno.makeTempFile({ suffix: ".jsonl" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-validator-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-validator-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -904,7 +1373,10 @@ stages:
       assertEquals(output.code, 0);
       assertEquals(report.ok, true);
       assertEquals(report.result.warnings.length, 1);
-      assertEquals(report.result.warnings[0].kind, "validator_mismatch.contains");
+      assertEquals(
+        report.result.warnings[0].kind,
+        "validator_mismatch.contains",
+      );
       assertEquals(report.result.traces[0].subtraces.length, 1);
     } finally {
       await server.close();
@@ -916,7 +1388,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts retries record_transform turn rewrites and reports attempt metadata",
+  name:
+    "main.ts retries record_transform turn rewrites and reports attempt metadata",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     let callIndex = 0;
@@ -937,7 +1410,9 @@ Deno.test({
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
     const inputPath = await Deno.makeTempFile({ suffix: ".jsonl" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-retry-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-retry-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -1008,6 +1483,9 @@ stages:
       assertEquals(report.result.traces[0].subtraces.length, 2);
       assertEquals(report.result.traces[0].subtraces[0].attempt, 1);
       assertEquals(report.result.traces[0].subtraces[1].attempt, 2);
+      assertEquals(report.result.stageMeta.rewrite.sampleCount, 1);
+      assertEquals(report.result.stageMeta.rewrite.successCount, 1);
+      assertEquals(report.result.stageMeta.rewrite.failureCount, 0);
       assertEquals(report.result.warnings.length, 0);
     } finally {
       await server.close();
@@ -1019,7 +1497,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts similarity validators can retry repeated assistant rewrites and preserve warning semantics",
+  name:
+    "main.ts similarity validators can retry repeated assistant rewrites and preserve warning semantics",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     let callIndex = 0;
@@ -1038,7 +1517,9 @@ Deno.test({
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
     const inputPath = await Deno.makeTempFile({ suffix: ".jsonl" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-similarity-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-similarity-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -1047,9 +1528,15 @@ Deno.test({
           id: 1,
           conversations: [
             { from: "human", value: "Explain a hash map simply." },
-            { from: "gpt", value: "A hash map stores values by key for fast lookup." },
+            {
+              from: "gpt",
+              value: "A hash map stores values by key for fast lookup.",
+            },
             { from: "human", value: "When would I use one?" },
-            { from: "gpt", value: "Use one when you need fast lookups by key." },
+            {
+              from: "gpt",
+              value: "Use one when you need fast lookups by key.",
+            },
           ],
         }),
       );
@@ -1115,7 +1602,10 @@ stages:
       assertEquals(report.ok, true);
       assertEquals(report.result.warnings.length, 0);
       assertEquals(report.result.traces[0].subtraces.length, 3);
-      assertEquals(report.result.traces[0].subtraces[1].failureKind, "validator_mismatch");
+      assertEquals(
+        report.result.traces[0].subtraces[1].failureKind,
+        "validator_mismatch",
+      );
       assertStringIncludes(
         report.result.traces[0].subtraces[1].validationIssues[0].message,
         "previous_same_role_turn.value",
@@ -1134,7 +1624,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts scoped similarity validators ignore reasoning boilerplate while still enforcing answer diversity",
+  name:
+    "main.ts scoped similarity validators ignore reasoning boilerplate while still enforcing answer diversity",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     let callIndex = 0;
@@ -1153,7 +1644,9 @@ Deno.test({
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
     const inputPath = await Deno.makeTempFile({ suffix: ".jsonl" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-scope-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-scope-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -1162,9 +1655,15 @@ Deno.test({
           id: 1,
           conversations: [
             { from: "human", value: "Explain a hash map simply." },
-            { from: "gpt", value: "A hash map stores values by key for fast lookup." },
+            {
+              from: "gpt",
+              value: "A hash map stores values by key for fast lookup.",
+            },
             { from: "human", value: "When would I use one?" },
-            { from: "gpt", value: "Use one when you need fast lookups by key." },
+            {
+              from: "gpt",
+              value: "Use one when you need fast lookups by key.",
+            },
           ],
         }),
       );
@@ -1251,7 +1750,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts detailed similarity mode can accept paraphrases that fast mode rejects",
+  name:
+    "main.ts detailed similarity mode can accept paraphrases that fast mode rejects",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     const paraphrase = "You have fifteen minutes before the link expires.";
@@ -1261,10 +1761,16 @@ Deno.test({
       })
     );
 
-    const fastPipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
-    const detailedPipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
+    const fastPipelinePath = await Deno.makeTempFile({
+      suffix: ".pipeline.yaml",
+    });
+    const detailedPipelinePath = await Deno.makeTempFile({
+      suffix: ".pipeline.yaml",
+    });
     const inputPath = await Deno.makeTempFile({ suffix: ".jsonl" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-detailed-sim-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-detailed-sim-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -1373,8 +1879,12 @@ stages:
 
       const fastOutput = await fastCommand.output();
       const detailedOutput = await detailedCommand.output();
-      const fastReport = JSON.parse(new TextDecoder().decode(fastOutput.stdout).trim());
-      const detailedReport = JSON.parse(new TextDecoder().decode(detailedOutput.stdout).trim());
+      const fastReport = JSON.parse(
+        new TextDecoder().decode(fastOutput.stdout).trim(),
+      );
+      const detailedReport = JSON.parse(
+        new TextDecoder().decode(detailedOutput.stdout).trim(),
+      );
 
       assertEquals(fastOutput.code, 0);
       assertEquals(detailedOutput.code, 0);
@@ -1395,7 +1905,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts must_change_from_ref accepts reasoning-prefix rewrites and retries copy-through outputs",
+  name:
+    "main.ts must_change_from_ref accepts reasoning-prefix rewrites and retries copy-through outputs",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     let callIndex = 0;
@@ -1412,7 +1923,9 @@ Deno.test({
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
     const inputPath = await Deno.makeTempFile({ suffix: ".jsonl" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-must-change-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-must-change-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -1477,7 +1990,9 @@ stages:
       const output = await command.output();
       const stdout = new TextDecoder().decode(output.stdout).trim();
       const report = JSON.parse(stdout);
-      const outputText = await Deno.readTextFile(`${outputDir}/must-change-transform-run.jsonl`);
+      const outputText = await Deno.readTextFile(
+        `${outputDir}/must-change-transform-run.jsonl`,
+      );
       const outputRecord = JSON.parse(outputText.trim());
 
       assertEquals(output.code, 0);
@@ -1488,7 +2003,10 @@ stages:
         report.result.traces[0].subtraces[0].validationIssues[0].message,
         "Value must differ from ref 'original_target_content'",
       );
-      assertEquals(outputRecord.conversations[1].value, "<reasoning>Plan</reasoning> Hello there");
+      assertEquals(
+        outputRecord.conversations[1].value,
+        "<reasoning>Plan</reasoning> Hello there",
+      );
     } finally {
       await server.close();
       await Deno.remove(pipelinePath).catch(() => {});
@@ -1499,7 +2017,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts remaps prefixed string conversation input before record_transform",
+  name:
+    "main.ts remaps prefixed string conversation input before record_transform",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     const server = startLocalServer(async () =>
@@ -1514,7 +2033,9 @@ Deno.test({
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
     const inputPath = await Deno.makeTempFile({ suffix: ".json" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-remap-prefixed-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-remap-prefixed-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -1587,8 +2108,14 @@ stages:
       assertEquals(report.inputFormat, "json");
       assertEquals(report.inputRecordCount, 1);
       assertEquals(outputRecord.conversation[0], "user: Hello");
-      assertEquals(outputRecord.conversations[0], { from: "user", value: "Hello" });
-      assertEquals(outputRecord.conversations[1].value, "<reasoning>Plan</reasoning> Hi there");
+      assertEquals(outputRecord.conversations[0], {
+        from: "user",
+        value: "Hello",
+      });
+      assertEquals(
+        outputRecord.conversations[1].value,
+        "<reasoning>Plan</reasoning> Hi there",
+      );
     } finally {
       await server.close();
       await Deno.remove(pipelinePath).catch(() => {});
@@ -1614,7 +2141,9 @@ Deno.test({
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
     const inputPath = await Deno.makeTempFile({ suffix: ".jsonl" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-remap-alpaca-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-remap-alpaca-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -1703,7 +2232,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts writes a default report file and prints summary output by default",
+  name:
+    "main.ts writes a default report file and prints summary output by default",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     const server = startLocalServer(async () =>
@@ -1713,7 +2243,9 @@ Deno.test({
     );
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-summary-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-summary-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -1766,7 +2298,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts warnings console mode prints compact warnings instead of full report",
+  name:
+    "main.ts warnings console mode prints compact warnings instead of full report",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     const server = startLocalServer(async () =>
@@ -1777,7 +2310,9 @@ Deno.test({
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
     const inputPath = await Deno.makeTempFile({ suffix: ".jsonl" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-warnings-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-warnings-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -1871,7 +2406,9 @@ Deno.test({
     );
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-thoughts-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-thoughts-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -1904,17 +2441,29 @@ stages:
         stderr: "piped",
       }).output();
       const withThoughts = await new Deno.Command(Deno.execPath(), {
-        args: [...baseArgs.slice(0, 7), "--show-thoughts", ...baseArgs.slice(7)],
+        args: [
+          ...baseArgs.slice(0, 7),
+          "--show-thoughts",
+          ...baseArgs.slice(7),
+        ],
         stdout: "piped",
         stderr: "piped",
       }).output();
 
       assertEquals(
-        new TextDecoder().decode(withoutThoughts.stdout).includes("Model thoughts:"),
+        new TextDecoder().decode(withoutThoughts.stdout).includes(
+          "Model thoughts:",
+        ),
         false,
       );
-      assertStringIncludes(new TextDecoder().decode(withThoughts.stdout), "Model thoughts:");
-      assertStringIncludes(new TextDecoder().decode(withThoughts.stdout), "private chain");
+      assertStringIncludes(
+        new TextDecoder().decode(withThoughts.stdout),
+        "Model thoughts:",
+      );
+      assertStringIncludes(
+        new TextDecoder().decode(withThoughts.stdout),
+        "private chain",
+      );
     } finally {
       await server.close();
       await Deno.remove(pipelinePath).catch(() => {});
@@ -1924,7 +2473,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts workflow_delegate uses child workflow runtime config and propagates delegated output",
+  name:
+    "main.ts workflow_delegate uses child workflow runtime config and propagates delegated output",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     let parentCallCount = 0;
@@ -1932,11 +2482,17 @@ Deno.test({
       parentCallCount++;
       if (parentCallCount === 1) {
         return Response.json({
-          choices: [{ message: { content: JSON.stringify({ candidate: { text: "hello" } }) } }],
+          choices: [{
+            message: {
+              content: JSON.stringify({ candidate: { text: "hello" } }),
+            },
+          }],
         });
       }
       return Response.json({
-        choices: [{ message: { content: JSON.stringify({ finalized: true }) } }],
+        choices: [{
+          message: { content: JSON.stringify({ finalized: true }) },
+        }],
       });
     });
 
@@ -1948,13 +2504,19 @@ Deno.test({
       const messages = payload.messages ?? [];
       childLastPrompt = messages[messages.length - 1]?.content ?? "";
       return Response.json({
-        choices: [{ message: { content: JSON.stringify({ decision: { route: "accept" } }) } }],
+        choices: [{
+          message: {
+            content: JSON.stringify({ decision: { route: "accept" } }),
+          },
+        }],
       });
     });
 
     const parentPath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
     const childPath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-delegate-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-delegate-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -2022,7 +2584,9 @@ stages:
       assertEquals(report.result.stageStatuses.finalize, "executed");
       assertStringIncludes(childLastPrompt, "Initial Context (JSON):");
       assertStringIncludes(childLastPrompt, '"text": "hello"');
-      assertEquals(report.result.outputsByStage.delegated, { decision: { route: "accept" } });
+      assertEquals(report.result.outputsByStage.delegated, {
+        decision: { route: "accept" },
+      });
     } finally {
       await parentServer.close();
       await childServer.close();
@@ -2034,7 +2598,8 @@ stages:
 });
 
 Deno.test({
-  name: "main.ts supports streaming record_transform with checkpoint and resume",
+  name:
+    "main.ts supports streaming record_transform with checkpoint and resume",
   permissions: { read: true, write: true, net: true, run: true, env: true },
   async fn() {
     let callIndex = 0;
@@ -2043,7 +2608,8 @@ Deno.test({
       return Response.json({
         choices: [{
           message: {
-            content: `<reasoning>${callIndex}</reasoning>\nrewritten-${callIndex}`,
+            content:
+              `<reasoning>${callIndex}</reasoning>\nrewritten-${callIndex}`,
           },
         }],
       });
@@ -2051,7 +2617,9 @@ Deno.test({
 
     const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
     const inputPath = await Deno.makeTempFile({ suffix: ".jsonl" });
-    const outputDir = await Deno.makeTempDir({ prefix: "datagen-output-stream-resume-" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-stream-resume-",
+    });
 
     try {
       await Deno.writeTextFile(
@@ -2116,12 +2684,15 @@ stages:
         stdout: "piped",
         stderr: "piped",
       }).output();
-      const firstReport = JSON.parse(new TextDecoder().decode(firstRun.stdout).trim());
+      const firstReport = JSON.parse(
+        new TextDecoder().decode(firstRun.stdout).trim(),
+      );
 
       const checkpointPath = `${outputDir}/stream-resume-run.checkpoint.json`;
       const checkpoint = JSON.parse(await Deno.readTextFile(checkpointPath));
       const outputPath = `${outputDir}/stream-resume-run.jsonl`;
-      const firstOutputLines = (await Deno.readTextFile(outputPath)).trim().split("\n");
+      const firstOutputLines = (await Deno.readTextFile(outputPath)).trim()
+        .split("\n");
 
       assertEquals(firstRun.code, 0);
       assertEquals(firstReport.ok, true);
@@ -2146,8 +2717,11 @@ stages:
         stdout: "piped",
         stderr: "piped",
       }).output();
-      const secondReport = JSON.parse(new TextDecoder().decode(secondRun.stdout).trim());
-      const secondOutputLines = (await Deno.readTextFile(outputPath)).trim().split("\n");
+      const secondReport = JSON.parse(
+        new TextDecoder().decode(secondRun.stdout).trim(),
+      );
+      const secondOutputLines = (await Deno.readTextFile(outputPath)).trim()
+        .split("\n");
 
       assertEquals(secondRun.code, 0);
       assertEquals(secondReport.ok, true);
@@ -2158,6 +2732,134 @@ stages:
       await server.close();
       await Deno.remove(pipelinePath).catch(() => {});
       await Deno.remove(inputPath).catch(() => {});
+      await Deno.remove(outputDir, { recursive: true }).catch(() => {});
+    }
+  },
+});
+
+Deno.test({
+  name: "main.ts executes lua stages end-to-end and writes output artifacts",
+  permissions: { read: true, write: true, run: true, env: true, net: true },
+  async fn() {
+    const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-lua-success-",
+    });
+
+    try {
+      await Deno.writeTextFile(
+        pipelinePath,
+        `
+name: lua-success-run
+model: yaml-model
+outputDir: ${outputDir.replace(/\\/g, "/")}
+stages:
+  - id: lua_stage
+    mode: lua
+    instructions: Run lua
+    lua:
+      source: inline
+      code: |
+        local ctx = ...
+        return { ok = true, stage = ctx.stageIdentifier }
+`,
+      );
+
+      const output = await new Deno.Command(Deno.execPath(), {
+        args: [
+          "run",
+          "--allow-read",
+          "--allow-write",
+          "--allow-net",
+          "--allow-env",
+          "main.ts",
+          "--console",
+          "full",
+          pipelinePath,
+        ],
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+
+      const report = JSON.parse(new TextDecoder().decode(output.stdout).trim());
+      const outputJsonl = await Deno.readTextFile(
+        `${outputDir}/lua-success-run.jsonl`,
+      );
+      const outputRecord = JSON.parse(outputJsonl.trim());
+
+      assertEquals(output.code, 0);
+      assertEquals(report.ok, true);
+      assertEquals(report.result.ok, true);
+      assertEquals(report.result.outputsByStage.lua_stage, {
+        ok: true,
+        stage: "lua_stage",
+      });
+      assertEquals(outputRecord, {
+        ok: true,
+        stage: "lua_stage",
+      });
+    } finally {
+      await Deno.remove(pipelinePath).catch(() => {});
+      await Deno.remove(outputDir, { recursive: true }).catch(() => {});
+    }
+  },
+});
+
+Deno.test({
+  name: "main.ts surfaces lua stage failures with lua-specific error kind",
+  permissions: { read: true, write: true, run: true, env: true, net: true },
+  async fn() {
+    const pipelinePath = await Deno.makeTempFile({ suffix: ".pipeline.yaml" });
+    const outputDir = await Deno.makeTempDir({
+      prefix: "datagen-output-lua-failure-",
+    });
+
+    try {
+      await Deno.writeTextFile(
+        pipelinePath,
+        `
+name: lua-failure-run
+model: yaml-model
+outputDir: ${outputDir.replace(/\\/g, "/")}
+stages:
+  - id: lua_stage
+    mode: lua
+    instructions: Run lua
+    lua:
+      source: inline
+      code: |
+        this is invalid lua
+`,
+      );
+
+      const output = await new Deno.Command(Deno.execPath(), {
+        args: [
+          "run",
+          "--allow-read",
+          "--allow-write",
+          "--allow-net",
+          "--allow-env",
+          "main.ts",
+          "--console",
+          "full",
+          pipelinePath,
+        ],
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+
+      const report = JSON.parse(new TextDecoder().decode(output.stdout).trim());
+
+      assertEquals(output.code, 3);
+      assertEquals(report.ok, false);
+      assertEquals(report.result.ok, false);
+      assertEquals(report.result.failedStage.stageIdentifier, "lua_stage");
+      assertEquals(
+        report.result.failedStage.error.kind,
+        "lua_execution_failed",
+      );
+    } finally {
+      await Deno.remove(pipelinePath).catch(() => {});
       await Deno.remove(outputDir, { recursive: true }).catch(() => {});
     }
   },

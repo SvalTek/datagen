@@ -3,24 +3,20 @@ name: sample-sharegpt-reasoning-rewrite
 description: Rewrite ShareGPT-style assistant turns to prepend a short reasoning block.
 
 input:
-  path: ./data/sample-sharegpt.jsonl
+  path: ./examples/data/sample-sharegpt.jsonl
   format: jsonl
 
-model: qwen2.5:14b
-# Ollama
-#endpoint: http://localhost:11434/
+model: qwen2.5-coder:14b
+provider: ollama
+endpoint: http://localhost:11434/
 
 # OpenRouter
 #endpoint: https://openrouter.ai/api/
 #apiKeyEnv: OPENROUTER_API_KEY
 #httpReferer: https://example.com/datagen
-xTitle: Datagen
+#xTitle: Datagen
 
-# koboldcpp
-endpoint:  http://192.168.0.100:5001
-apiKeyEnv: KOBOLDCPP_API_KEY
-
-outputDir: ./output
+outputDir: ./examples/outputs
 
 stages:
   - name: rewrite_assistant_turns
@@ -34,8 +30,8 @@ stages:
       wrapped in <think>...</think>, followed by the final answer.
       The reasoning block should be written in first-person from the assistant's perspective, describing the thought process to arrive at the answer.
       Preserve the meaning of the original assistant turn.
-      Return exactly one single-line minified JSON object with exactly one string
-      field named content containing the full rewritten turn.
+      Return only the full rewritten target turn text.
+      Do not return JSON or any text before or after the rewritten turn.
       Only rewrite the target assistant turn.
     retry:
       enabled: true
@@ -45,11 +41,11 @@ stages:
         - path: content
           kind: contains
           value: "<think>"
-          hint: Start with a short <think>...</think> block. Return exactly one JSON object with one string field named content.
+          hint: Start with a short <think>...</think> block inside the rewritten turn text.
         - path: content
           kind: regex
           pattern: "^<think>[\\s\\S]*?</think>\\s*.+$"
-          hint: After the reasoning block, include the actual final answer text as well, and keep the whole rewritten turn inside the content string.
+          hint: After the reasoning block, include the actual final answer text in the same rewritten turn.
         - path: content
           kind: max_similarity_to_ref
           ref: previous_same_role_turn.value
@@ -68,5 +64,5 @@ stages:
       roleField: from
       contentField: value
       targetRoles:
-        - gpt
+        - assistant
       includeOriginalTargetTurn: true

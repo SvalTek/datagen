@@ -156,6 +156,210 @@ Deno.test("rewriteConversationRecord rewrites only target turns and uses prior r
   );
 });
 
+Deno.test("rewriteConversationRecord can preprocess target turns and gate rewrites with turnWhen", async () => {
+  const seenPayloads: ChatTransportPayload[] = [];
+  const stage: StageInput = {
+    instructions: "Rewrite only short assistant turns with a reasoning prefix.",
+    mode: "record_transform",
+    transform: {
+      kind: "conversation_rewrite",
+      conversationsPath: "conversations",
+      roleField: "from",
+      contentField: "value",
+      targetRoles: ["gpt"],
+      turnPreprocess: {
+        source: "inline",
+        code: `
+local ctx = ...
+local turn = Datagen.clone(ctx.turn)
+local text = Datagen.get(turn, "value", "")
+turn.length_class = (#text <= 12) and "short" or "long"
+return turn
+`,
+      },
+      turnWhen: {
+        path: "length_class",
+        equals: "short",
+      },
+    },
+  };
+
+  const result = await rewriteConversationRecord(
+    {
+      conversations: [
+        { from: "human", value: "Hi" },
+        { from: "gpt", value: "Hello" },
+        { from: "human", value: "Tell me more" },
+        { from: "gpt", value: "This answer is definitely too long to classify as short." },
+      ],
+    },
+    stage,
+    makeSessionFactory(
+      ["<reasoning>Short</reasoning>\nHello"],
+      seenPayloads,
+    ),
+  );
+
+  assertEquals(result.warnings, []);
+  assertEquals(seenPayloads.length, 1);
+  assertEquals(
+    (result.record as any).conversations[1],
+    {
+      from: "gpt",
+      value: "<reasoning>Short</reasoning>\nHello",
+      length_class: "short",
+    },
+  );
+  assertEquals(
+    (result.record as any).conversations[3],
+    {
+      from: "gpt",
+      value: "This answer is definitely too long to classify as short.",
+      length_class: "long",
+    },
+  );
+});
+
+Deno.test("rewriteConversationRecord supports any in turnWhen", async () => {
+  const seenPayloads: ChatTransportPayload[] = [];
+  const stage: StageInput = {
+    instructions: "Rewrite allowed assistant turns.",
+    mode: "record_transform",
+    transform: {
+      kind: "conversation_rewrite",
+      conversationsPath: "conversations",
+      roleField: "from",
+      contentField: "value",
+      targetRoles: ["gpt"],
+      turnPreprocess: {
+        source: "inline",
+        code: `
+local ctx = ...
+local turn = Datagen.clone(ctx.turn)
+local text = Datagen.get(turn, "value", "")
+if #text <= 5 then
+  turn.length_class = "short"
+elseif #text <= 20 then
+  turn.length_class = "medium"
+else
+  turn.length_class = "long"
+end
+return turn
+`,
+      },
+      turnWhen: {
+        path: "length_class",
+        any: ["short", "medium"],
+      },
+    },
+  };
+
+  const result = await rewriteConversationRecord(
+    {
+      conversations: [
+        { from: "human", value: "Hi" },
+        { from: "gpt", value: "Hey" },
+        { from: "human", value: "Continue" },
+        { from: "gpt", value: "Some medium text" },
+        { from: "human", value: "More" },
+        { from: "gpt", value: "This one is definitely much longer than twenty characters." },
+      ],
+    },
+    stage,
+    makeSessionFactory(
+      [
+        "<reasoning>A</reasoning>\nHey",
+        "<reasoning>B</reasoning>\nSome medium text",
+      ],
+      seenPayloads,
+    ),
+  );
+
+  assertEquals(seenPayloads.length, 2);
+  assertEquals((result.record as any).conversations[1].length_class, "short");
+  assertEquals((result.record as any).conversations[3].length_class, "medium");
+  assertEquals((result.record as any).conversations[5].length_class, "long");
+  assertEquals(
+    (result.record as any).conversations[5].value,
+    "This one is definitely much longer than twenty characters.",
+  );
+});
+
+Deno.test("rewriteConversationRecord keeps original turn when turnPreprocess returns a non-object", async () => {
+  const stage: StageInput = {
+    instructions: "Rewrite the assistant turn.",
+    mode: "record_transform",
+    transform: {
+      kind: "conversation_rewrite",
+      conversationsPath: "conversations",
+      roleField: "from",
+      contentField: "value",
+      targetRoles: ["gpt"],
+      turnPreprocess: {
+        source: "inline",
+        code: `return "bad-output"`,
+      },
+    },
+  };
+
+  const result = await rewriteConversationRecord(
+    {
+      conversations: [
+        { from: "human", value: "Hi" },
+        { from: "gpt", value: "Hello there" },
+      ],
+    },
+    stage,
+    makeSessionFactory([], []),
+  );
+
+  assertEquals((result.record as any).conversations[1].value, "Hello there");
+  assertEquals(result.warnings.length, 1);
+  assertEquals(result.warnings[0].kind, "invalid_turn_preprocess_output");
+});
+
+Deno.test("rewriteConversationRecord skips rewrite when turnPreprocess changes role to a non-target role", async () => {
+  const seenPayloads: ChatTransportPayload[] = [];
+  const stage: StageInput = {
+    instructions: "Rewrite the assistant turn.",
+    mode: "record_transform",
+    transform: {
+      kind: "conversation_rewrite",
+      conversationsPath: "conversations",
+      roleField: "from",
+      contentField: "value",
+      targetRoles: ["gpt"],
+      turnPreprocess: {
+        source: "inline",
+        code: `
+local ctx = ...
+local turn = Datagen.clone(ctx.turn)
+turn.from = "system"
+return turn
+`,
+      },
+    },
+  };
+
+  const result = await rewriteConversationRecord(
+    {
+      conversations: [
+        { from: "human", value: "Hi" },
+        { from: "gpt", value: "Hello there" },
+      ],
+    },
+    stage,
+    makeSessionFactory(["should-not-be-used"], seenPayloads),
+  );
+
+  assertEquals(seenPayloads.length, 0);
+  assertEquals(result.warnings, []);
+  assertEquals((result.record as any).conversations[1], {
+    from: "system",
+    value: "Hello there",
+  });
+});
+
 Deno.test("rewriteConversationRecord keeps original turn and emits warning on empty output", async () => {
   const stage: StageInput = {
     instructions: "Rewrite the assistant turn.",
