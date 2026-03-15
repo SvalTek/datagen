@@ -1,0 +1,257 @@
+version: 1
+name: fintech-accounts-risk-dataset
+description: Multi-stage synthetic fintech account risk and behavior dataset.
+# Ollama
+model: qwen2.5:14b
+provider: ollama
+endpoint: http://localhost:11434/
+outputDir: ./output
+stages:
+  - name: seed_accounts
+    instructions: >
+      Generate exactly 12 synthetic fintech account records as JSON.
+      Return a JSON object with a top-level "records" array.
+      Each record must contain:
+      - accountId (string, unique, like "acct-001")
+      - region (string; one of "NA", "EU", "LATAM", "APAC")
+      - industry (string; one of "retail", "logistics", "health", "education", "finance")
+      - accountAgeMonths (number)
+      - monthlyTxnCount (number)
+      - avgTxnAmount (number)
+      - chargebackRate (number between 0 and 1)
+      - failedLoginCount30d (number)
+      - kycStatus (string; one of "verified", "pending", "expired")
+      - supportTickets30d (number)
+      Output only valid JSON.
+    constrain:
+      type: object
+      shape:
+        records:
+          type: array
+          minItems: 12
+          maxItems: 12
+          items:
+            type: object
+            shape:
+              accountId:
+                type: string
+                pattern: "^acct-[0-9]{3}$"
+              region:
+                type: enum
+                values: ["NA", "EU", "LATAM", "APAC"]
+              industry:
+                type: enum
+                values: ["retail", "logistics", "health", "education", "finance"]
+              accountAgeMonths:
+                type: number
+                min: 0
+              monthlyTxnCount:
+                type: number
+                min: 0
+              avgTxnAmount:
+                type: number
+                min: 0
+              chargebackRate:
+                type: number
+                min: 0
+                max: 1
+              failedLoginCount30d:
+                type: number
+                min: 0
+              kycStatus:
+                type: enum
+                values: ["verified", "pending", "expired"]
+              supportTickets30d:
+                type: number
+                min: 0
+  - name: quality_cleanup
+    instructions: >
+      Using prior stage outputs, normalize and validate each record.
+      Return a JSON object with "records" containing exactly the same number of items.
+      Enforce:
+      - no duplicate accountId
+      - all numeric fields are non-negative
+      - chargebackRate is clamped to [0, 1]
+      - if kycStatus is "expired", failedLoginCount30d must be at least 1
+      Keep schema unchanged in this stage.
+      Output only valid JSON.
+    constrain:
+      type: object
+      shape:
+        records:
+          type: array
+          minItems: 12
+          maxItems: 12
+          items:
+            type: object
+            shape:
+              accountId:
+                type: string
+                pattern: "^acct-[0-9]{3}$"
+              region:
+                type: enum
+                values: ["NA", "EU", "LATAM", "APAC"]
+              industry:
+                type: enum
+                values: ["retail", "logistics", "health", "education", "finance"]
+              accountAgeMonths:
+                type: number
+                min: 0
+              monthlyTxnCount:
+                type: number
+                min: 0
+              avgTxnAmount:
+                type: number
+                min: 0
+              chargebackRate:
+                type: number
+                min: 0
+                max: 1
+              failedLoginCount30d:
+                type: number
+                min: 0
+              kycStatus:
+                type: enum
+                values: ["verified", "pending", "expired"]
+              supportTickets30d:
+                type: number
+                min: 0
+  - name: derive_features
+    instructions: >
+      Using prior stage outputs, add derived features to each record:
+      - monthlyVolume = monthlyTxnCount * avgTxnAmount
+      - anomalyScore (number from 0 to 100; higher means riskier)
+      - riskTier (string; one of "low", "medium", "high", "critical")
+      - reviewFlag (boolean)
+      Rules:
+      - riskTier should correlate with anomalyScore
+      - critical accounts should usually have high chargebackRate or high failedLoginCount30d
+      Return a JSON object with "records" containing full records including original + derived fields.
+      Output only valid JSON.
+    constrain:
+      type: object
+      shape:
+        records:
+          type: array
+          minItems: 12
+          maxItems: 12
+          items:
+            type: object
+            shape:
+              accountId:
+                type: string
+                pattern: "^acct-[0-9]{3}$"
+              region:
+                type: enum
+                values: ["NA", "EU", "LATAM", "APAC"]
+              industry:
+                type: enum
+                values: ["retail", "logistics", "health", "education", "finance"]
+              accountAgeMonths:
+                type: number
+                min: 0
+              monthlyTxnCount:
+                type: number
+                min: 0
+              avgTxnAmount:
+                type: number
+                min: 0
+              chargebackRate:
+                type: number
+                min: 0
+                max: 1
+              failedLoginCount30d:
+                type: number
+                min: 0
+              kycStatus:
+                type: enum
+                values: ["verified", "pending", "expired"]
+              supportTickets30d:
+                type: number
+                min: 0
+              monthlyVolume:
+                type: number
+                min: 0
+              anomalyScore:
+                type: number
+                min: 0
+                max: 100
+              riskTier:
+                type: enum
+                values: ["low", "medium", "high", "critical"]
+              reviewFlag:
+                type: boolean
+  - name: finalize_dataset
+    instructions: >
+      Using prior stage outputs, produce the final training dataset.
+      Keep exactly 12 records.
+      Add:
+      - label (string; one of "approve", "manual_review", "deny")
+      - labelReason (short string)
+      Labeling policy:
+      - low risk usually -> approve
+      - medium/high risk -> manual_review unless clearly severe
+      - critical risk with suspicious patterns -> deny
+      Ensure labels are internally consistent with anomalyScore, riskTier, chargebackRate,
+      failedLoginCount30d, and kycStatus.
+      Return a JSON object with top-level "records" only.
+      Output only valid JSON.
+    constrain:
+      type: object
+      shape:
+        records:
+          type: array
+          minItems: 12
+          maxItems: 12
+          items:
+            type: object
+            shape:
+              accountId:
+                type: string
+                pattern: "^acct-[0-9]{3}$"
+              region:
+                type: enum
+                values: ["NA", "EU", "LATAM", "APAC"]
+              industry:
+                type: enum
+                values: ["retail", "logistics", "health", "education", "finance"]
+              accountAgeMonths:
+                type: number
+                min: 0
+              monthlyTxnCount:
+                type: number
+                min: 0
+              avgTxnAmount:
+                type: number
+                min: 0
+              chargebackRate:
+                type: number
+                min: 0
+                max: 1
+              failedLoginCount30d:
+                type: number
+                min: 0
+              kycStatus:
+                type: enum
+                values: ["verified", "pending", "expired"]
+              supportTickets30d:
+                type: number
+                min: 0
+              monthlyVolume:
+                type: number
+                min: 0
+              anomalyScore:
+                type: number
+                min: 0
+                max: 100
+              riskTier:
+                type: enum
+                values: ["low", "medium", "high", "critical"]
+              reviewFlag:
+                type: boolean
+              label:
+                type: enum
+                values: ["approve", "manual_review", "deny"]
+              labelReason:
+                type: string
+                minLength: 1

@@ -1,0 +1,78 @@
+version: 1
+name: arcane-city-rp-dataset
+description: Multi-stage synthetic roleplay character and scenario dataset for a cyber-arcane city setting.
+model: qwen2.5:14b
+endpoint: http://localhost:11434/
+outputDir: ./output
+
+stages:
+  - name: seed_characters
+    mode: batch
+    instructions: >
+      Generate exactly 10 roleplay character profiles set in a cyber-arcane metropolis.
+      Return a JSON array.
+
+      Each character must contain:
+      - characterId (string, unique, like "char-001")
+      - name (string)
+      - archetype (string; e.g., "netrunner", "street mage", "corporate fixer", "rogue AI", "investigator")
+      - affiliation (string; faction or organization name)
+      - coreMotivation (short string)
+      - hiddenSecret (short string)
+      - personalityTraits (array of 3 strings)
+      - powerOrSkill (short string)
+      - internalConflict (short string)
+
+      Ensure variety in archetypes and affiliations.
+      Output only valid JSON.
+
+  - name: world_consistency_pass
+    mode: iter
+    instructions: >
+      Using prior stage outputs and the current character item, ensure internal world coherence.
+
+      Return exactly one JSON object for the current character item.
+
+      Enforce:
+      - Keep characterId unchanged
+      - Keep schema unchanged
+      - InternalConflict aligns with coreMotivation
+
+      Do not change the schema.
+      Output only valid JSON.
+
+  - name: derive_story_hooks
+    mode: iter
+    instructions: >
+      Using prior stage outputs and the current character item, add derived narrative elements.
+
+      Add:
+      - storyHooks (array of 2 short scenario prompts involving other characters by characterId)
+      - relationshipTensionLevel (number from 0 to 100)
+      - narrativeRole (string; one of "protagonist", "antagonist", "support", "wildcard")
+
+      Rules:
+      - relationshipTensionLevel should reflect how disruptive their hiddenSecret is
+      - At least 2 characters should plausibly function as antagonists
+      - storyHooks must reference other characterIds for cross-linking
+
+      Return one JSON object for the current character item with original + derived fields.
+      Output only valid JSON.
+
+  - name: finalize_rp_dataset
+    mode: iter
+    instructions: >
+      Using prior stage outputs and the current character item, produce final RP fields.
+
+      Add:
+      - openingScene (short paragraph in third person, in a consistent noir-cyber tone)
+      - dialogueSample (2–4 lines of in-character dialogue)
+      - rpConflictTag (string; one of "betrayal", "power struggle", "forbidden magic", "AI uprising", "corporate espionage")
+
+      Ensure:
+      - Tone is consistent across all characters.
+      - dialogueSample matches personalityTraits.
+      - rpConflictTag aligns with storyHooks and hiddenSecret.
+
+      Return one JSON object for the current character item.
+      Output only valid JSON.

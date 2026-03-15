@@ -1,0 +1,72 @@
+version: 1
+name: sample-sharegpt-reasoning-rewrite
+description: Rewrite ShareGPT-style assistant turns to prepend a short reasoning block.
+
+input:
+  path: ./data/sample-sharegpt.jsonl
+  format: jsonl
+
+model: qwen2.5:14b
+# Ollama
+#endpoint: http://localhost:11434/
+
+# OpenRouter
+#endpoint: https://openrouter.ai/api/
+#apiKeyEnv: OPENROUTER_API_KEY
+#httpReferer: https://example.com/datagen
+xTitle: Datagen
+
+# koboldcpp
+endpoint:  http://192.168.0.100:5001
+apiKeyEnv: KOBOLDCPP_API_KEY
+
+outputDir: ./output
+
+stages:
+  - name: rewrite_assistant_turns
+    mode: record_transform
+    input:
+      source: pipeline_input
+    system: >
+      You are a thoughtful assistant that pauses briefly to reason before responding. Use <think> blocks to show short inner reasoning or reflection before the final answer.
+    instructions: >
+      Rewrite the target assistant turn so it starts with a short reasoning block
+      wrapped in <think>...</think>, followed by the final answer.
+      The reasoning block should be written in first-person from the assistant's perspective, describing the thought process to arrive at the answer.
+      Preserve the meaning of the original assistant turn.
+      Return exactly one single-line minified JSON object with exactly one string
+      field named content containing the full rewritten turn.
+      Only rewrite the target assistant turn.
+    retry:
+      enabled: true
+      maxAttempts: 2
+    validate:
+      rules:
+        - path: content
+          kind: contains
+          value: "<think>"
+          hint: Start with a short <think>...</think> block. Return exactly one JSON object with one string field named content.
+        - path: content
+          kind: regex
+          pattern: "^<think>[\\s\\S]*?</think>\\s*.+$"
+          hint: After the reasoning block, include the actual final answer text as well, and keep the whole rewritten turn inside the content string.
+        - path: content
+          kind: max_similarity_to_ref
+          ref: previous_same_role_turn.value
+          threshold: 0.82
+          scope:
+            excludePatterns:
+              - pattern: "<think>[\\s\\S]*?</think>"
+          hint: Do not reuse the same final answer wording as the previous assistant turn.
+        - path: content
+          kind: must_change_from_ref
+          ref: original_target_content
+          hint: Change the target turn instead of copying the original wording unchanged.
+    transform:
+      kind: conversation_rewrite
+      conversationsPath: conversations
+      roleField: from
+      contentField: value
+      targetRoles:
+        - gpt
+      includeOriginalTargetTurn: true
